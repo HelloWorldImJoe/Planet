@@ -260,6 +260,13 @@ class PlanetAPIController: NSObject, ObservableObject {
         builder.delete("v0", "planets", "my", "**") { req async throws -> Response in
             return try await self.routeDeletePlanetArticle(fromRequest: req)
         }
+
+        //MARK: GET /v0/search
+        //MARK: Search My Planets and articles -
+        /// Return APISearchResponse with matching planets and articles
+        builder.get("v0", "search") { req async throws -> Response in
+            return try await self.routeSearch(fromRequest: req)
+        }
     }
 
     private func configure(_ app: Application) throws {
@@ -468,12 +475,15 @@ class PlanetAPIController: NSObject, ObservableObject {
             }
             return ""
         }()
-        let planetTemplateName: String = {
+        let planetTemplateName: String = try {
             let template: String = p.template ?? ""
             if TemplateStore.shared.hasTemplate(named: template) {
                 return template
             }
-            return TemplateStore.shared.templates.first!.name
+            guard let defaultTemplateName = TemplateStore.shared.defaultNewPlanetTemplateName() else {
+                throw Abort(.internalServerError, reason: "No templates are available.")
+            }
+            return defaultTemplateName
         }()
         let planet = try await MyPlanetModel.create(
             name: planetName,
@@ -631,7 +641,7 @@ class PlanetAPIController: NSObject, ObservableObject {
         }
         // TODO: What if the saveToArticle operation is a Task.detached?
         try await MainActor.run {
-            try draft.saveToArticle()
+            _ = try draft.saveToArticle()
         }
         if let a = planet.articles.first {
             return try self.createResponse(from: a, status: .created)
@@ -706,9 +716,65 @@ class PlanetAPIController: NSObject, ObservableObject {
             }
         }
         try await MainActor.run {
-            try draft.saveToArticle()
+            _ = try draft.saveToArticle()
         }
         return try self.createResponse(from: article, status: .accepted)
+    }
+
+    private func routeSearch(fromRequest req: Request) async throws -> Response {
+        guard let query = req.query[String.self, at: "q"],
+              !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw Abort(.badRequest, reason: "Missing or empty search query. Use ?q=<term>.")
+        }
+        let searchText = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let matchingPlanets: [APISearchResultPlanet] = await MainActor.run {
+            PlanetStore.shared.myPlanets
+                .filter { planet in
+                    planet.name.range(of: searchText, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+                    || planet.about.range(of: searchText, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+                }
+                .map { planet in
+                    APISearchResultPlanet(
+                        id: planet.id,
+                        name: planet.name,
+                        about: planet.about,
+                        created: planet.created,
+                        updated: planet.updated
+                    )
+                }
+        }
+
+        let searchLimit = req.query[Int.self, at: "limit"] ?? 20
+
+        let allResults = await PlanetStore.shared.searchAllArticles(text: searchText)
+        let matchingArticles: [APISearchResultArticle] = Array(
+            allResults
+                .prefix(max(1, min(200, searchLimit)))
+                .map { result in
+                    APISearchResultArticle(
+                        articleID: result.articleID,
+                        articleCreated: result.articleCreated,
+                        articleNumber: result.articleNumber,
+                        articleReference: result.articleReference,
+                        title: result.title,
+                        preview: result.preview,
+                        planetID: result.planetID,
+                        planetName: result.planetName,
+                        relevanceScore: result.relevanceScore,
+                        bm25Score: result.bm25Score,
+                        vectorScore: result.vectorScore,
+                        source: result.bm25Score != nil && result.vectorScore != nil ? "both"
+                            : result.bm25Score != nil ? "bm25" : result.vectorScore != nil ? "vector" : "fallback"
+                    )
+                }
+        )
+
+        let response = APISearchResponse(
+            planets: matchingPlanets,
+            articles: matchingArticles
+        )
+        return try self.createResponse(from: response, status: .ok)
     }
 
     private func routeDeletePlanetArticle(fromRequest req: Request) async throws -> Response {

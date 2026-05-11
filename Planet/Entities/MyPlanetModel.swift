@@ -7,15 +7,26 @@ import SwiftyJSON
 import UserNotifications
 import os
 
+private struct TemplateSettingsFiltersCache: Codable {
+    let templateName: String
+    let settingsHash: String
+    let solverVersion: Int
+    let values: [String: String]
+}
+
 class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codable {
     static let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "MyPlanet")
     static let RESERVED_KEYWORDS_FOR_TAGS = ["index", "tags", "archive", "archives"]
+    private static let templateSettingsFiltersCacheVersion = 1
 
     let id: UUID
     @Published var name: String
     @Published var about: String
     @Published var domain: String?
     @Published var authorName: String?
+    @Published var slug: String? = nil
+    @Published var nextArticleNumber: Int? = nil
+    private let articleNumberAllocationLock = NSLock()
     let created: Date
     let ipns: String
     @Published var updated: Date
@@ -68,10 +79,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     @Published var juiceboxProjectID: Int?
     @Published var juiceboxProjectIDGoerli: Int?
 
-    @Published var farcasterEnabled: Bool? = false
-    @Published var farcasterUsername: String?
-    @Published var farcasterJSON: String?
-
     @Published var acceptsDonation: Bool? = false
     @Published var acceptsDonationMessage: String?
     @Published var acceptsDonationETHAddress: String?
@@ -91,7 +98,13 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     @Published var drafts: [DraftModel]! = nil
     @Published var articles: [MyArticleModel]! = nil
 
-    var ops: [String: Date] = [:]
+    // Protects the in-memory ops cache from parallel article rebuild tasks.
+    private let opsLock = NSLock()
+    private var ops: [String: Date] = [:]
+    // Protects cached template settings/filter expansion during parallel article renders.
+    private let templateSettingsCacheLock = NSLock()
+    private var cachedTemplateSettingsAndFilters: TemplateSettingsFiltersCache? = nil
+    private var queuedAutoPublishAfterRebuild = false
     var attachmentsLastVerified: Date? = nil
     @Published var needsRebuild: Bool = false
 
@@ -111,13 +124,104 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     /// Prewarm new post on public gateway
     @Published var prewarmNewPost: Bool? = true
 
+    /// Publish the latest CID to this planet's IPNS record
+    @Published var publishAsIPNS: Bool? = true
+
+    /// Publish the generated site to a remote server with rsync over SSH
+    @Published var sshRsyncEnabled: Bool? = false
+    @Published var sshRsyncDestination: String?
+    /// Original filename of the user-selected SSH key (the key itself is stored in basePath/ssh_key)
+    @Published var sshRsyncKeyPath: String?
+    @Published var sshRsyncDeleteEnabled: Bool? = false
+
+    /// Publish the generated site to Cloudflare Pages via Direct Upload
+    @Published var cloudflarePagesEnabled: Bool? = false
+    @Published var cloudflarePagesAccountID: String?
+    @Published var cloudflarePagesAPIToken: String?
+    @Published var cloudflarePagesProjectName: String?
+    @Published var cloudflarePagesLastDeployedProjectName: String?
+    @Published var cloudflarePagesLastDeployedURL: String?
+
+    private static let sshRsyncDestinationRegex: NSRegularExpression = {
+        try! NSRegularExpression(
+            pattern: #"^[^@\s:/]+@[^:\s/]+:\S+$"#,
+            options: []
+        )
+    }()
+
     static func myPlanetsPath() -> URL {
         let url = URLUtils.repoPath().appendingPathComponent("My", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
     static func isReservedTag(_ tag: String) -> Bool {
         return RESERVED_KEYWORDS_FOR_TAGS.contains(tag)
+    }
+    static func normalizedSSHRsyncDestination(_ destination: String?) -> String? {
+        guard let destination else { return nil }
+        let trimmed = destination.trim()
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    static func isValidSSHRsyncDestination(_ destination: String) -> Bool {
+        let normalizedDestination = destination.trim()
+        let range = NSRange(location: 0, length: normalizedDestination.utf16.count)
+        return sshRsyncDestinationRegex.firstMatch(
+            in: normalizedDestination,
+            options: [],
+            range: range
+        ) != nil
+    }
+    private static func perfNow() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+    private static func perfElapsed(since startedAt: UInt64) -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds - startedAt
+    }
+    private static func perfErrorField(_ error: Error) -> String {
+        "error=\(PerfLogger.quoted(String(describing: error)))"
+    }
+    private func perfBaseFields(scope: String) -> [String] {
+        [
+            "scope=\(scope)",
+            "planet_id=\(id.uuidString)",
+            "planet_name=\(PerfLogger.quoted(name))",
+            "article_count=\(articles.count)",
+        ]
+    }
+    private func logPerf(scope: String, fields: [String]) {
+        PerfLogger.record(perfBaseFields(scope: scope) + fields)
+    }
+    private func logRebuildPerf(kind: String, fields: [String]) {
+        logPerf(scope: "rebuild", fields: ["kind=\(kind)"] + fields)
+    }
+    private func logPlanetPublicPerf(fields: [String]) {
+        guard isRebuilding else {
+            return
+        }
+        logPerf(scope: "planet_public", fields: fields)
+    }
+    private func saveOpsInBackground(kind: String) {
+        Task(priority: .background) {
+            let startedAt = Self.perfNow()
+            do {
+                try self.saveOps()
+                debugPrint("saved ops.json")
+                self.logRebuildPerf(kind: kind, fields: [
+                    "phase=save_ops_background",
+                    "result=success",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: startedAt)))",
+                ])
+            }
+            catch {
+                debugPrint("failed to save ops to file: \(error)")
+                self.logRebuildPerf(kind: kind, fields: [
+                    "phase=save_ops_background",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: startedAt)))",
+                    Self.perfErrorField(error),
+                ])
+            }
+        }
     }
     func removeReservedTags() -> [String: String] {
         var tags = self.tags ?? [:]
@@ -128,6 +232,9 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     }
     var basePath: URL {
         return Self.myPlanetsPath().appendingPathComponent(self.id.uuidString, isDirectory: true)
+    }
+    var sshRsyncKeyStorePath: URL {
+        return basePath.appendingPathComponent("ssh_key", isDirectory: false)
     }
     var infoPath: URL {
         return Self.myPlanetsPath().appendingPathComponent(self.id.uuidString, isDirectory: true)
@@ -167,7 +274,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
 
     static func publicPlanetsPath() -> URL {
         let url = URLUtils.repoPath().appendingPathComponent("Public", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
     var publicBasePath: URL {
@@ -268,34 +375,187 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             isDirectory: true
         ).appendingPathComponent("templateSettings.json", isDirectory: false)
     }
-    func templateSettings() -> [String: String] {
+    var templateSettingsFiltersCachePath: URL {
+        return Self.myPlanetsPath().appendingPathComponent(self.id.uuidString, isDirectory: true)
+            .appendingPathComponent("templateSettingsFilters.json", isDirectory: false)
+    }
+    private func loadTemplateSettingsFromDisk() -> [String: String] {
         if let data = try? Data(contentsOf: templateSettingsPath) {
             if let json = try? JSONSerialization.jsonObject(with: data, options: []) {
-                if let dict = json as? [String: String] {
+                if let dict = Self.stringTemplateSettings(from: json) {
                     return dict
                 }
             }
         }
         return [:]
     }
-    func templateSettingsAndFilters() -> [String: String] {
-        if let data = try? Data(contentsOf: templateSettingsPath) {
-            if let json = try? JSONSerialization.jsonObject(with: data, options: []) {
-                if var dict = json as? [String: String] {
-                    for (key, value) in dict {
-                        if key.hasSuffix("Color") {
-                            let targetColor = CustomColor(hex: value)
-                            let baseColor = CustomColor(hex: "#000000")
-                            let solver = Solver(target: targetColor, baseColor: baseColor)
-                            let result = solver.solve()
-                            dict[key + "Filter"] = result.filter
-                        }
-                    }
-                    return dict
-                }
+
+    private static func stringTemplateSettings(from json: Any) -> [String: String]? {
+        guard let dict = json as? [String: Any] else {
+            return nil
+        }
+        return dict.reduce(into: [:]) { result, item in
+            if let value = item.value as? String {
+                result[item.key] = value
+            }
+            else if Self.isJSONBoolean(item.value), let value = item.value as? Bool {
+                result[item.key] = value ? "true" : "false"
+            }
+            else if let value = item.value as? NSNumber {
+                result[item.key] = value.stringValue
             }
         }
-        return [:]
+    }
+
+    private static func isJSONBoolean(_ value: Any) -> Bool {
+        return CFGetTypeID(value as CFTypeRef) == CFBooleanGetTypeID()
+    }
+
+    private static func templateSettingsHash(for settings: [String: String]) -> String {
+        do {
+            let data = try JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys])
+            return data.sha256().toHexString()
+        }
+        catch {
+            return ""
+        }
+    }
+    private static func buildTemplateSettingsAndFilters(from settings: [String: String]) -> [String: String] {
+        var dict = settings
+        let filterableSettings = settings
+            .filter { key, value in
+                key.hasSuffix("Color") && CustomColor.supportsHexFilterComputation(value)
+            }
+            .sorted { $0.key < $1.key }
+
+        guard !filterableSettings.isEmpty else {
+            return dict
+        }
+
+        let baseColor = CustomColor(hex: "#000000")
+        let filtersLock = NSLock()
+        var filters: [String: String] = [:]
+        DispatchQueue.concurrentPerform(iterations: filterableSettings.count) { index in
+            let (key, value) = filterableSettings[index]
+            let targetColor = CustomColor(hex: value)
+            let solver = Solver(target: targetColor, baseColor: baseColor)
+            let result = solver.solve()
+            filtersLock.lock()
+            filters[key + "Filter"] = result.filter
+            filtersLock.unlock()
+        }
+
+        for (key, value) in filters {
+            dict[key] = value
+        }
+        return dict
+    }
+    private func saveTemplateSettingsAndFiltersCache(_ cache: TemplateSettingsFiltersCache) throws {
+        let cacheData = try JSONEncoder.shared.encode(cache)
+        try cacheData.write(to: templateSettingsFiltersCachePath, options: .atomic)
+    }
+    private func loadTemplateSettingsAndFiltersCacheIfValid(
+        settingsHash: String
+    ) throws -> TemplateSettingsFiltersCache? {
+        guard FileManager.default.fileExists(atPath: templateSettingsFiltersCachePath.path) else {
+            return nil
+        }
+        let cacheData = try Data(contentsOf: templateSettingsFiltersCachePath)
+        let cache = try JSONDecoder.shared.decode(TemplateSettingsFiltersCache.self, from: cacheData)
+        guard cache.templateName == templateName else {
+            return nil
+        }
+        guard cache.settingsHash == settingsHash else {
+            return nil
+        }
+        guard cache.solverVersion == Self.templateSettingsFiltersCacheVersion else {
+            return nil
+        }
+        return cache
+    }
+    private func loadTemplateSettingsAndFiltersCache() throws {
+        let settings = loadTemplateSettingsFromDisk()
+        let settingsHash = Self.templateSettingsHash(for: settings)
+        let cache = try loadTemplateSettingsAndFiltersCacheIfValid(settingsHash: settingsHash)
+        replaceTemplateSettingsAndFiltersCache(cache)
+    }
+    private func replaceTemplateSettingsAndFiltersCache(_ cache: TemplateSettingsFiltersCache?) {
+        templateSettingsCacheLock.lock()
+        cachedTemplateSettingsAndFilters = cache
+        templateSettingsCacheLock.unlock()
+    }
+    private func makeTemplateSettingsAndFiltersCache(
+        from settings: [String: String]
+    ) -> TemplateSettingsFiltersCache {
+        TemplateSettingsFiltersCache(
+            templateName: templateName,
+            settingsHash: Self.templateSettingsHash(for: settings),
+            solverVersion: Self.templateSettingsFiltersCacheVersion,
+            values: Self.buildTemplateSettingsAndFilters(from: settings)
+        )
+    }
+    private func cachedTemplateSettingsAndFiltersValuesIfValid() -> [String: String]? {
+        templateSettingsCacheLock.lock()
+        defer { templateSettingsCacheLock.unlock() }
+        guard let cachedTemplateSettingsAndFilters else {
+            return nil
+        }
+        guard cachedTemplateSettingsAndFilters.templateName == templateName else {
+            self.cachedTemplateSettingsAndFilters = nil
+            return nil
+        }
+        guard cachedTemplateSettingsAndFilters.solverVersion == Self.templateSettingsFiltersCacheVersion else {
+            self.cachedTemplateSettingsAndFilters = nil
+            return nil
+        }
+        return cachedTemplateSettingsAndFilters.values
+    }
+    private func templateSettingsAndFiltersCacheValues(
+        from settings: [String: String]
+    ) -> [String: String] {
+        templateSettingsCacheLock.lock()
+        defer { templateSettingsCacheLock.unlock() }
+
+        let settingsHash = Self.templateSettingsHash(for: settings)
+        if let cachedTemplateSettingsAndFilters,
+            cachedTemplateSettingsAndFilters.templateName == templateName,
+            cachedTemplateSettingsAndFilters.settingsHash == settingsHash,
+            cachedTemplateSettingsAndFilters.solverVersion == Self.templateSettingsFiltersCacheVersion
+        {
+            return cachedTemplateSettingsAndFilters.values
+        }
+
+        if let diskCache = try? loadTemplateSettingsAndFiltersCacheIfValid(settingsHash: settingsHash) {
+            cachedTemplateSettingsAndFilters = diskCache
+            return diskCache.values
+        }
+
+        let cache = makeTemplateSettingsAndFiltersCache(from: settings)
+        cachedTemplateSettingsAndFilters = cache
+        do {
+            try saveTemplateSettingsAndFiltersCache(cache)
+        }
+        catch {
+            debugPrint("failed to save template settings filters cache: \(error)")
+        }
+        return cache.values
+    }
+    private func invalidateTemplateSettingsAndFiltersCache() {
+        templateSettingsCacheLock.lock()
+        cachedTemplateSettingsAndFilters = nil
+        templateSettingsCacheLock.unlock()
+    }
+    func warmTemplateSettingsAndFiltersCache() {
+        _ = templateSettingsAndFilters()
+    }
+    func templateSettings() -> [String: String] {
+        loadTemplateSettingsFromDisk()
+    }
+    func templateSettingsAndFilters() -> [String: String] {
+        if let cachedValues = cachedTemplateSettingsAndFiltersValuesIfValid() {
+            return cachedValues
+        }
+        return templateSettingsAndFiltersCacheValues(from: loadTemplateSettingsFromDisk())
     }
 
     func writeTemplateSettings() {
@@ -324,11 +584,13 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             }
             if touched {
                 let data = try JSONSerialization.data(withJSONObject: currentSettings, options: [.prettyPrinted, .sortedKeys])
-                try data.write(to: templateSettingsPath)
+                try data.write(to: templateSettingsPath, options: .atomic)
+                invalidateTemplateSettingsAndFiltersCache()
                 debugPrint("Wrote full template settings for \(name)")
             }
             try self.copyTemplateSettings()
         } catch {
+            invalidateTemplateSettingsAndFiltersCache()
             debugPrint("Error writing template settings: \(error)")
         }
     }
@@ -355,11 +617,13 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             }
             // Write settings
             let data = try JSONSerialization.data(withJSONObject: currentSettings, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: templateSettingsPath)
+            try data.write(to: templateSettingsPath, options: .atomic)
+            invalidateTemplateSettingsAndFiltersCache()
 
             try self.copyTemplateSettings()
         }
         catch {
+            invalidateTemplateSettingsAndFiltersCache()
             debugPrint("Error updating template settings: \(error) \(settings)")
         }
     }
@@ -448,12 +712,112 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         return URL(string: "https://\(cid).eth.sucks/")
     }
 
+    var cloudflarePagesURL: URL? {
+        guard cloudflarePagesEnabled ?? false,
+              let projectName = cloudflarePagesProjectName?.trim(),
+              !projectName.isEmpty,
+              let deployedProjectName = cloudflarePagesLastDeployedProjectName?.trim(),
+              deployedProjectName == projectName,
+              let urlString = cloudflarePagesLastDeployedURL,
+              let url = URL(string: urlString)
+        else {
+            return nil
+        }
+        return url
+    }
+
+    var articleReferencePrefix: String {
+        if let slug = slug?.trim(), !slug.isEmpty {
+            return slug.uppercased()
+        }
+        return String(id.uuidString.prefix(8)).uppercased()
+    }
+
+    @discardableResult
+    func ensureArticleNumbers() -> Bool {
+        articleNumberAllocationLock.lock()
+        defer {
+            articleNumberAllocationLock.unlock()
+        }
+
+        guard articles != nil else {
+            if nextArticleNumber == nil {
+                nextArticleNumber = 1
+                return true
+            }
+            return false
+        }
+
+        var changed = false
+        var usedNumbers = Set<Int>()
+        let orderedArticles = articles.sorted {
+            if $0.created != $1.created {
+                return $0.created < $1.created
+            }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+
+        for article in orderedArticles {
+            guard let articleNumber = article.articleNumber, articleNumber > 0 else {
+                if article.articleNumber != nil {
+                    article.articleNumber = nil
+                    changed = true
+                }
+                continue
+            }
+            if usedNumbers.contains(articleNumber) {
+                article.articleNumber = nil
+                changed = true
+            }
+            else {
+                usedNumbers.insert(articleNumber)
+            }
+        }
+
+        var nextNumber = max(nextArticleNumber ?? 1, (usedNumbers.max() ?? 0) + 1)
+        for article in orderedArticles where article.articleNumber == nil {
+            article.articleNumber = nextNumber
+            usedNumbers.insert(nextNumber)
+            nextNumber += 1
+            changed = true
+        }
+
+        let minimumNextNumber = (usedNumbers.max() ?? 0) + 1
+        if nextArticleNumber == nil || (nextArticleNumber ?? 1) < minimumNextNumber {
+            nextArticleNumber = minimumNextNumber
+            changed = true
+        }
+
+        return changed
+    }
+
+    func allocateArticleNumber() -> Int {
+        articleNumberAllocationLock.lock()
+        defer {
+            articleNumberAllocationLock.unlock()
+        }
+
+        let highestExistingNumber = articles?
+            .compactMap { article -> Int? in
+                guard let articleNumber = article.articleNumber, articleNumber > 0 else {
+                    return nil
+                }
+                return articleNumber
+            }
+            .max() ?? 0
+        let number = max(nextArticleNumber ?? 1, highestExistingNumber + 1)
+        nextArticleNumber = number + 1
+        return number
+    }
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
         hasher.combine(name)
         hasher.combine(about)
         hasher.combine(domain)
         hasher.combine(authorName)
+        hasher.combine(slug)
+        hasher.combine(nextArticleNumber)
         hasher.combine(created)
         hasher.combine(ipns)
         hasher.combine(updated)
@@ -504,10 +868,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         hasher.combine(juiceboxProjectID)
         hasher.combine(juiceboxProjectIDGoerli)
 
-        hasher.combine(farcasterEnabled)
-        hasher.combine(farcasterUsername)
-        hasher.combine(farcasterJSON)
-
         hasher.combine(acceptsDonation)
         hasher.combine(acceptsDonationMessage)
         hasher.combine(acceptsDonationETHAddress)
@@ -524,6 +884,17 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         hasher.combine(saveRoundAvatar)
         hasher.combine(doNotIndex)
         hasher.combine(prewarmNewPost)
+        hasher.combine(publishAsIPNS)
+        hasher.combine(sshRsyncEnabled)
+        hasher.combine(sshRsyncDestination)
+        hasher.combine(sshRsyncKeyPath)
+        hasher.combine(sshRsyncDeleteEnabled)
+        hasher.combine(cloudflarePagesEnabled)
+        hasher.combine(cloudflarePagesAccountID)
+        hasher.combine(cloudflarePagesAPIToken)
+        hasher.combine(cloudflarePagesProjectName)
+        hasher.combine(cloudflarePagesLastDeployedProjectName)
+        hasher.combine(cloudflarePagesLastDeployedURL)
     }
 
     static func == (lhs: MyPlanetModel, rhs: MyPlanetModel) -> Bool {
@@ -538,6 +909,8 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             && lhs.about == rhs.about
             && lhs.domain == rhs.domain
             && lhs.authorName == rhs.authorName
+            && lhs.slug == rhs.slug
+            && lhs.nextArticleNumber == rhs.nextArticleNumber
             && lhs.created == rhs.created
             && lhs.ipns == rhs.ipns
             && lhs.updated == rhs.updated
@@ -582,9 +955,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             && lhs.juiceboxEnabled == rhs.juiceboxEnabled
             && lhs.juiceboxProjectID == rhs.juiceboxProjectID
             && lhs.juiceboxProjectIDGoerli == rhs.juiceboxProjectIDGoerli
-            && lhs.farcasterEnabled == rhs.farcasterEnabled
-            && lhs.farcasterUsername == rhs.farcasterUsername
-            && lhs.farcasterJSON == rhs.farcasterJSON
             && lhs.acceptsDonation == rhs.acceptsDonation
             && lhs.acceptsDonationMessage == rhs.acceptsDonationMessage
             && lhs.acceptsDonationETHAddress == rhs.acceptsDonationETHAddress
@@ -598,10 +968,21 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             && lhs.saveRoundAvatar == rhs.saveRoundAvatar
             && lhs.doNotIndex == rhs.doNotIndex
             && lhs.prewarmNewPost == rhs.prewarmNewPost
+            && lhs.publishAsIPNS == rhs.publishAsIPNS
+            && lhs.sshRsyncEnabled == rhs.sshRsyncEnabled
+            && lhs.sshRsyncDestination == rhs.sshRsyncDestination
+            && lhs.sshRsyncKeyPath == rhs.sshRsyncKeyPath
+            && lhs.sshRsyncDeleteEnabled == rhs.sshRsyncDeleteEnabled
+            && lhs.cloudflarePagesEnabled == rhs.cloudflarePagesEnabled
+            && lhs.cloudflarePagesAccountID == rhs.cloudflarePagesAccountID
+            && lhs.cloudflarePagesAPIToken == rhs.cloudflarePagesAPIToken
+            && lhs.cloudflarePagesProjectName == rhs.cloudflarePagesProjectName
+            && lhs.cloudflarePagesLastDeployedProjectName == rhs.cloudflarePagesLastDeployedProjectName
+            && lhs.cloudflarePagesLastDeployedURL == rhs.cloudflarePagesLastDeployedURL
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, name, about, domain, authorName, ipns,
+        case id, name, about, domain, authorName, slug, nextArticleNumber, ipns,
             created, updated,
             templateName, lastPublished, lastPublishedCID,
             archived, archivedAt,
@@ -615,13 +996,18 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             customCodeBodyEndEnabled, customCodeBodyEnd,
             podcastCategories, podcastLanguage, podcastExplicit,
             juiceboxEnabled, juiceboxProjectID, juiceboxProjectIDGoerli,
-            farcasterEnabled, farcasterUsername, farcasterJSON,
             acceptsDonation, acceptsDonationMessage, acceptsDonationETHAddress,
             tags,
             aggregation, reuseOriginalID,
             saveRoundAvatar,
             doNotIndex,
-            prewarmNewPost
+            prewarmNewPost,
+            publishAsIPNS,
+            sshRsyncEnabled, sshRsyncDestination, sshRsyncKeyPath,
+            sshRsyncDeleteEnabled,
+            cloudflarePagesEnabled, cloudflarePagesAccountID, cloudflarePagesAPIToken,
+            cloudflarePagesProjectName, cloudflarePagesLastDeployedProjectName,
+            cloudflarePagesLastDeployedURL
     }
 
     // `@Published` property wrapper invalidates default decode/encode implementation
@@ -633,6 +1019,8 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         about = try container.decode(String.self, forKey: .about)
         domain = try container.decodeIfPresent(String.self, forKey: .domain)
         authorName = try container.decodeIfPresent(String.self, forKey: .authorName)
+        slug = try container.decodeIfPresent(String.self, forKey: .slug)
+        nextArticleNumber = try container.decodeIfPresent(Int.self, forKey: .nextArticleNumber)
         ipns = try container.decode(String.self, forKey: .ipns)
         created = try container.decode(Date.self, forKey: .created)
         updated = try container.decode(Date.self, forKey: .updated)
@@ -694,26 +1082,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             Int.self,
             forKey: .juiceboxProjectIDGoerli
         )
-        farcasterEnabled = try container.decodeIfPresent(Bool.self, forKey: .farcasterEnabled)
-        farcasterUsername = try container.decodeIfPresent(
-            String.self,
-            forKey: .farcasterUsername
-        )
-        farcasterJSON = try container.decodeIfPresent(String.self, forKey: .farcasterJSON)
-        if farcasterJSON == nil {
-            // Try read from disk
-            let jsonpath = self.publicBasePath
-                .appendingPathComponent("farcaster.json", isDirectory: false)
-            if FileManager.default.fileExists(atPath: jsonpath.path) {
-                do {
-                    let data = try Data(contentsOf: jsonpath)
-                    let json = try JSON(data: data)
-                    farcasterJSON = json.rawString()
-                } catch {
-                    MyPlanetModel.logger.error("Error reading farcaster.json: \(error)")
-                }
-            }
-        }
         acceptsDonation = try container.decodeIfPresent(Bool.self, forKey: .acceptsDonation)
         acceptsDonationMessage = try container.decodeIfPresent(
             String.self,
@@ -741,6 +1109,52 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             Bool.self,
             forKey: .prewarmNewPost
         )
+        publishAsIPNS = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .publishAsIPNS
+        ) ?? true
+        sshRsyncEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sshRsyncEnabled
+        ) ?? false
+        sshRsyncDestination = Self.normalizedSSHRsyncDestination(
+            try container.decodeIfPresent(
+                String.self,
+                forKey: .sshRsyncDestination
+            )
+        )
+        sshRsyncKeyPath = try container.decodeIfPresent(
+            String.self,
+            forKey: .sshRsyncKeyPath
+        )
+        sshRsyncDeleteEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sshRsyncDeleteEnabled
+        ) ?? false
+        cloudflarePagesEnabled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .cloudflarePagesEnabled
+        ) ?? false
+        cloudflarePagesAccountID = try container.decodeIfPresent(
+            String.self,
+            forKey: .cloudflarePagesAccountID
+        )
+        cloudflarePagesAPIToken = try container.decodeIfPresent(
+            String.self,
+            forKey: .cloudflarePagesAPIToken
+        )
+        cloudflarePagesProjectName = try container.decodeIfPresent(
+            String.self,
+            forKey: .cloudflarePagesProjectName
+        )
+        cloudflarePagesLastDeployedProjectName = try container.decodeIfPresent(
+            String.self,
+            forKey: .cloudflarePagesLastDeployedProjectName
+        )
+        cloudflarePagesLastDeployedURL = try container.decodeIfPresent(
+            String.self,
+            forKey: .cloudflarePagesLastDeployedURL
+        )
     }
 
     func encode(to encoder: Encoder) throws {
@@ -750,6 +1164,8 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         try container.encode(about, forKey: .about)
         try container.encodeIfPresent(domain, forKey: .domain)
         try container.encodeIfPresent(authorName, forKey: .authorName)
+        try container.encodeIfPresent(slug, forKey: .slug)
+        try container.encodeIfPresent(nextArticleNumber, forKey: .nextArticleNumber)
         try container.encode(ipns, forKey: .ipns)
         try container.encode(created, forKey: .created)
         try container.encode(updated, forKey: .updated)
@@ -793,9 +1209,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         try container.encodeIfPresent(juiceboxEnabled, forKey: .juiceboxEnabled)
         try container.encodeIfPresent(juiceboxProjectID, forKey: .juiceboxProjectID)
         try container.encodeIfPresent(juiceboxProjectIDGoerli, forKey: .juiceboxProjectIDGoerli)
-        try container.encodeIfPresent(farcasterEnabled, forKey: .farcasterEnabled)
-        try container.encodeIfPresent(farcasterUsername, forKey: .farcasterUsername)
-        try container.encodeIfPresent(farcasterJSON, forKey: .farcasterJSON)
         try container.encodeIfPresent(acceptsDonation, forKey: .acceptsDonation)
         try container.encodeIfPresent(acceptsDonationMessage, forKey: .acceptsDonationMessage)
         try container.encodeIfPresent(acceptsDonationETHAddress, forKey: .acceptsDonationETHAddress)
@@ -805,6 +1218,26 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         try container.encodeIfPresent(saveRoundAvatar, forKey: .saveRoundAvatar)
         try container.encodeIfPresent(doNotIndex, forKey: .doNotIndex)
         try container.encodeIfPresent(prewarmNewPost, forKey: .prewarmNewPost)
+        try container.encodeIfPresent(publishAsIPNS, forKey: .publishAsIPNS)
+        try container.encodeIfPresent(sshRsyncEnabled, forKey: .sshRsyncEnabled)
+        try container.encodeIfPresent(
+            Self.normalizedSSHRsyncDestination(sshRsyncDestination),
+            forKey: .sshRsyncDestination
+        )
+        try container.encodeIfPresent(sshRsyncKeyPath, forKey: .sshRsyncKeyPath)
+        try container.encodeIfPresent(sshRsyncDeleteEnabled, forKey: .sshRsyncDeleteEnabled)
+        try container.encodeIfPresent(cloudflarePagesEnabled, forKey: .cloudflarePagesEnabled)
+        try container.encodeIfPresent(cloudflarePagesAccountID, forKey: .cloudflarePagesAccountID)
+        try container.encodeIfPresent(cloudflarePagesAPIToken, forKey: .cloudflarePagesAPIToken)
+        try container.encodeIfPresent(cloudflarePagesProjectName, forKey: .cloudflarePagesProjectName)
+        try container.encodeIfPresent(
+            cloudflarePagesLastDeployedProjectName,
+            forKey: .cloudflarePagesLastDeployedProjectName
+        )
+        try container.encodeIfPresent(
+            cloudflarePagesLastDeployedURL,
+            forKey: .cloudflarePagesLastDeployedURL
+        )
     }
 
     init(
@@ -863,7 +1296,14 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             try? MyArticleModel.load(from: $0, planet: planet)
         }
         planet.articles = articles.sorted(by: { MyArticleModel.reorder(a: $0, b: $1) })
+        if planet.ensureArticleNumbers() {
+            for article in planet.articles {
+                try? article.save()
+            }
+            try? planet.save()
+        }
         try? planet.loadOps()
+        try? planet.loadTemplateSettingsAndFiltersCache()
         return planet
     }
 
@@ -887,6 +1327,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         planet.podcastCoverArt = nil
         planet.drafts = []
         planet.articles = []
+        planet.nextArticleNumber = 1
         try FileManager.default.createDirectory(
             at: planet.basePath,
             withIntermediateDirectories: true
@@ -988,6 +1429,12 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         // Restore authorName
         if backupPlanet.authorName != nil {
             planet.authorName = backupPlanet.authorName
+        }
+        if backupPlanet.slug != nil {
+            planet.slug = backupPlanet.slug
+        }
+        if backupPlanet.nextArticleNumber != nil {
+            planet.nextArticleNumber = backupPlanet.nextArticleNumber
         }
 
         // Restore last published CID
@@ -1118,17 +1565,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             planet.juiceboxProjectIDGoerli = backupPlanet.juiceboxProjectIDGoerli
         }
 
-        // Restore Farcaster settings
-        if backupPlanet.farcasterEnabled != nil {
-            planet.farcasterEnabled = backupPlanet.farcasterEnabled
-        }
-        if backupPlanet.farcasterUsername != nil {
-            planet.farcasterUsername = backupPlanet.farcasterUsername
-        }
-        if backupPlanet.farcasterJSON != nil {
-            planet.farcasterJSON = backupPlanet.farcasterJSON
-        }
-
         // Restore Donation settings
         if backupPlanet.acceptsDonation != nil {
             planet.acceptsDonation = backupPlanet.acceptsDonation
@@ -1155,6 +1591,25 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
 
         // Restore prewarmNewPost
         planet.prewarmNewPost = backupPlanet.prewarmNewPost
+
+        // Restore publishAsIPNS
+        planet.publishAsIPNS = backupPlanet.publishAsIPNS ?? true
+
+        // Restore SSH rsync settings
+        planet.sshRsyncEnabled = backupPlanet.sshRsyncEnabled ?? false
+        planet.sshRsyncDestination = Self.normalizedSSHRsyncDestination(
+            backupPlanet.sshRsyncDestination
+        )
+        planet.sshRsyncKeyPath = backupPlanet.sshRsyncKeyPath
+        planet.sshRsyncDeleteEnabled = backupPlanet.sshRsyncDeleteEnabled ?? false
+
+        // Restore Cloudflare Pages settings
+        planet.cloudflarePagesEnabled = backupPlanet.cloudflarePagesEnabled ?? false
+        planet.cloudflarePagesAccountID = backupPlanet.cloudflarePagesAccountID
+        planet.cloudflarePagesAPIToken = backupPlanet.cloudflarePagesAPIToken
+        planet.cloudflarePagesProjectName = backupPlanet.cloudflarePagesProjectName
+        planet.cloudflarePagesLastDeployedProjectName = backupPlanet.cloudflarePagesLastDeployedProjectName
+        planet.cloudflarePagesLastDeployedURL = backupPlanet.cloudflarePagesLastDeployedURL
 
         // delete existing planet files if exists
         // it is important we validate that the planet does not exist, or we override an existing planet with a stale backup
@@ -1211,12 +1666,14 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                     id: backupArticle.id,
                     link: backupArticle.link,
                     slug: backupArticle.slug,
+                    articleNumber: backupArticle.articleNumber,
                     externalLink: backupArticle.externalLink,
                     title: backupArticle.title,
                     content: backupArticle.content,
                     contentRendered: backupArticle.contentRendered,
                     summary: backupArticle.summary,
                     created: backupArticle.created,
+                    modified: backupArticle.modified,
                     starred: nil,
                     starType: backupArticle.starType,
                     videoFilename: backupArticle.videoFilename,
@@ -1263,6 +1720,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         Self.logger.info(
             "Regenerated \(planet.articles.count) articles from backup articles for backup planet \(backupPlanet.id)"
         )
+        _ = planet.ensureArticleNumbers()
 
         try FileManager.default.createDirectory(
             at: planet.basePath,
@@ -1513,10 +1971,12 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         if !FileManager.default.fileExists(atPath: publicBasePath.path) {
             try FileManager.default.createDirectory(at: publicBasePath, withIntermediateDirectories: true)
         }
-        if FileManager.default.fileExists(atPath: publicAssetsPath.path) {
-            try FileManager.default.removeItem(at: publicAssetsPath)
+        if FileManager.default.fileExists(atPath: template.assetsPath.path) {
+            if FileManager.default.fileExists(atPath: publicAssetsPath.path) {
+                try FileManager.default.removeItem(at: publicAssetsPath)
+            }
+            try FileManager.default.copyItem(at: template.assetsPath, to: publicAssetsPath)
         }
-        try FileManager.default.copyItem(at: template.assetsPath, to: publicAssetsPath)
         if FileManager.default.fileExists(atPath: avatarPath.path), !FileManager.default.fileExists(atPath: publicAvatarPath.path) {
             try FileManager.default.copyItem(at: avatarPath, to: publicAvatarPath)
         }
@@ -1555,8 +2015,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                     juiceboxEnabled: juiceboxEnabled,
                     juiceboxProjectID: juiceboxProjectID,
                     juiceboxProjectIDGoerli: juiceboxProjectIDGoerli,
-                    farcasterEnabled: farcasterEnabled,
-                    farcasterUsername: farcasterUsername,
                     acceptsDonation: acceptsDonation,
                     acceptsDonationMessage: acceptsDonationMessage,
                     acceptsDonationETHAddress: acceptsDonationETHAddress,
@@ -1598,10 +2056,10 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                     context: context
                 )
                 if podcastOnly {
-                    try rssXML.data(using: .utf8)?.write(to: publicPodcastPath)
+                    try rssXML.data(using: .utf8)?.write(to: publicPodcastPath, options: .atomic)
                 }
                 else {
-                    try rssXML.data(using: .utf8)?.write(to: publicRSSPath)
+                    try rssXML.data(using: .utf8)?.write(to: publicRSSPath, options: .atomic)
                 }
             }
             catch {
@@ -1614,274 +2072,488 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         guard let template = template else {
             throw PlanetError.MissingTemplateError
         }
-        self.removeDSStore()
-        let siteNavigation = self.siteNavigation()
-        debugPrint("Planet Site Navigation: \(siteNavigation)")
-        let allArticles = articles.map { item in
-            return item.publicArticle
-        }
-        var publicArticles = articles.filter { $0.articleType == .blog }.map { $0.publicArticle }
-        // Check if all public articles have complete attachments
-        if let verified = attachmentsLastVerified, verified > Date().addingTimeInterval(-60 * 10) {
-            debugPrint("Attachments check: skipping, last verified \(verified)")
-        }
-        else {
-            debugPrint("Attachments check: running")
-            attachmentsLastVerified = Date()
-            debugPrint("Attachments check: About to check all attachments for planet \(name)")
-            for article in articles {
-                var shouldRemoveArticle = false
-                if let attachments = article.attachments {
-                    debugPrint("Attachments check: \(article.id) should have \(attachments.count) attachments")
-                    for attachment in attachments {
-                        var shouldRemove = false
-                        let attachmentPath = article.publicBasePath.appendingPathComponent(attachment)
-                        if !FileManager.default.fileExists(atPath: attachmentPath.path) {
-                            shouldRemoveArticle = true
-                            debugPrint("Attachments check: \(attachmentPath) not found")
-                        } else {
-                            let fileSize = try FileManager.default.attributesOfItem(atPath: attachmentPath.path)[.size] as? Int ?? 0
-                            if fileSize == 0 {
-                                debugPrint("Attachments check: \(attachmentPath) is empty")
-                                shouldRemove = true
-                            } else {
-                                if fileSize < 1000 {
+        let totalStartedAt = Self.perfNow()
+        var attachmentsCheckStatus = "skipped"
+        var publicArticlesCount = 0
+
+        do {
+            var phaseStartedAt = Self.perfNow()
+            self.removeDSStore()
+            logPlanetPublicPerf(fields: [
+                "phase=remove_ds_store",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+            ])
+
+            phaseStartedAt = Self.perfNow()
+            let siteNavigation = self.siteNavigation()
+            debugPrint("Planet Site Navigation: \(siteNavigation)")
+            logPlanetPublicPerf(fields: [
+                "phase=site_navigation_setup",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+            ])
+
+            phaseStartedAt = Self.perfNow()
+            let allArticles = articles.map { item in
+                item.publicArticle
+            }
+            var publicArticles = articles.filter { $0.articleType == .blog }.map { $0.publicArticle }
+            publicArticlesCount = publicArticles.count
+            logPlanetPublicPerf(fields: [
+                "phase=public_articles_projection",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                "public_article_count=\(publicArticlesCount)",
+            ])
+
+            phaseStartedAt = Self.perfNow()
+            if let verified = attachmentsLastVerified,
+                verified > Date().addingTimeInterval(-60 * 10)
+            {
+                attachmentsCheckStatus = "skipped"
+                debugPrint("Attachments check: skipping, last verified \(verified)")
+            }
+            else {
+                attachmentsCheckStatus = "ran"
+                debugPrint("Attachments check: running")
+                attachmentsLastVerified = Date()
+                debugPrint("Attachments check: About to check all attachments for planet \(name)")
+                for article in articles {
+                    var shouldRemoveArticle = false
+                    if let attachments = article.attachments {
+                        debugPrint(
+                            "Attachments check: \(article.id) should have \(attachments.count) attachments"
+                        )
+                        for attachment in attachments {
+                            var shouldRemove = false
+                            let attachmentPath = article.publicBasePath.appendingPathComponent(
+                                attachment
+                            )
+                            if !FileManager.default.fileExists(atPath: attachmentPath.path) {
+                                shouldRemoveArticle = true
+                                debugPrint("Attachments check: \(attachmentPath) not found")
+                            }
+                            else {
+                                let fileSize =
+                                    try FileManager.default.attributesOfItem(
+                                        atPath: attachmentPath.path
+                                    )[.size] as? Int ?? 0
+                                if fileSize == 0 {
+                                    debugPrint("Attachments check: \(attachmentPath) is empty")
+                                    shouldRemove = true
+                                }
+                                else if fileSize < 1000 {
                                     let fileDataString = try String(contentsOf: attachmentPath)
-                                    if fileDataString.contains("no link named") && fileDataString.contains("under") {
-                                        debugPrint("Attachments check: \(attachmentPath) is a broken link")
+                                    if fileDataString.contains("no link named")
+                                        && fileDataString.contains("under")
+                                    {
+                                        debugPrint(
+                                            "Attachments check: \(attachmentPath) is a broken link"
+                                        )
                                         shouldRemove = true
-                                    } else {
+                                    }
+                                    else {
                                         debugPrint("Attachments check: \(attachmentPath) is OK")
                                     }
-                                } else {
+                                }
+                                else {
                                     debugPrint("Attachments check: \(attachmentPath) is OK")
                                 }
                             }
-                        }
-                        if shouldRemove {
-                            shouldRemoveArticle = true
-                            debugPrint("Attachments check: \(attachmentPath) is broken, removing")
-                            try FileManager.default.removeItem(at: attachmentPath)
+                            if shouldRemove {
+                                shouldRemoveArticle = true
+                                debugPrint("Attachments check: \(attachmentPath) is broken, removing")
+                                try FileManager.default.removeItem(at: attachmentPath)
+                            }
                         }
                     }
-                }
-                if shouldRemoveArticle {
-                    debugPrint("Attachments check: \(article.id) has broken attachments, removing article from public site")
-                    publicArticles.removeAll { $0.id == article.id }
-                }
-            }
-        }
-        let publicPlanet = PublicPlanetModel(
-            id: id,
-            name: name,
-            about: about,
-            ipns: ipns,
-            created: created,
-            updated: updated,
-            articles: publicArticles,
-            plausibleEnabled: plausibleEnabled,
-            plausibleDomain: plausibleDomain,
-            plausibleAPIServer: plausibleAPIServer,
-            juiceboxEnabled: juiceboxEnabled,
-            juiceboxProjectID: juiceboxProjectID,
-            juiceboxProjectIDGoerli: juiceboxProjectIDGoerli,
-            farcasterEnabled: farcasterEnabled,
-            farcasterUsername: farcasterUsername,
-            acceptsDonation: acceptsDonation,
-            acceptsDonationMessage: acceptsDonationMessage,
-            acceptsDonationETHAddress: acceptsDonationETHAddress,
-            twitterUsername: twitterUsername,
-            githubUsername: githubUsername,
-            telegramUsername: telegramUsername,
-            mastodonUsername: mastodonUsername,
-            discordLink: discordLink,
-            podcastCategories: podcastCategories,
-            podcastLanguage: podcastLanguage,
-            podcastExplicit: podcastExplicit,
-            tags: tags
-        )
-        let hasPodcastCoverArt = FileManager.default.fileExists(
-            atPath: publicPodcastCoverArtPath.path
-        )
-
-        // MARK: - Render RSS and podcast RSS
-        renderRSS(podcastOnly: false)
-
-        if publicPlanet.hasAudioContent() {
-            renderRSS(podcastOnly: true)
-        }
-        reduceRebuildTasks()
-
-        // MARK: - Render index.html and pages
-        let itemsPerPage = template.idealItemsPerPage ?? 10
-        let generateIndexPagination = template.generateIndexPagination ?? false
-        if generateIndexPagination == true && publicPlanet.articles.count > itemsPerPage {
-            let pages = Int(ceil(Double(publicPlanet.articles.count) / Double(itemsPerPage)))
-            debugPrint("Rendering \(pages) pages")
-            for i in 1...pages {
-                let pageArticles = Array(
-                    publicPlanet.articles[
-                        (i - 1) * itemsPerPage..<min(i * itemsPerPage, publicPlanet.articles.count)
-                    ]
-                )
-                let pageContext: [String: Any] = [
-                    "planet": publicPlanet,
-                    "planet_ipns": self.ipns,
-                    "my_planet": self,
-                    "site_navigation": siteNavigation,
-                    "has_avatar": self.hasAvatar(),
-                    "og_image_url": ogImageURLString,
-                    "has_podcast": publicPlanet.hasAudioContent(),
-                    "has_podcast_cover_art": hasPodcastCoverArt,
-                    "page": i,
-                    "pages": pages,
-                    "articles": pageArticles,
-                ]
-                Task(priority: .userInitiated) {
-                    let pageHTML = try template.renderIndex(context: pageContext)
-                    let pagePath = publicIndexPagePath(page: i)
-                    try pageHTML.data(using: .utf8)?.write(to: pagePath)
-                }
-
-                if i == 1 {
-                    debugPrint("Build index.html: hasAvatar=\(self.hasAvatar())")
-                    Task(priority: .userInitiated) {
-                        let indexHTML = try template.renderIndex(context: pageContext)
-                        try indexHTML.data(using: .utf8)?.write(to: publicIndexPath)
+                    if shouldRemoveArticle {
+                        debugPrint(
+                            "Attachments check: \(article.id) has broken attachments, removing article from public site"
+                        )
+                        publicArticles.removeAll { $0.id == article.id }
                     }
                 }
             }
-        }
-        else {
-            let pageContext: [String: Any] = [
-                "planet": publicPlanet,
-                "planet_ipns": self.ipns,
-                "my_planet": self,
-                "site_navigation": siteNavigation,
-                "has_avatar": self.hasAvatar(),
-                "og_image_url": ogImageURLString,
-                "has_podcast": publicPlanet.hasAudioContent(),
-                "has_podcast_cover_art": hasPodcastCoverArt,
-                "articles": publicPlanet.articles,
-            ]
-            let pageHTML = try template.renderIndex(context: pageContext)
-            let pagePath = publicIndexPagePath(page: 1)
-            try pageHTML.data(using: .utf8)?.write(to: pagePath)
+            publicArticlesCount = publicArticles.count
+            logPlanetPublicPerf(fields: [
+                "phase=attachments_check",
+                "status=\(attachmentsCheckStatus)",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                "public_article_count=\(publicArticlesCount)",
+            ])
 
-            let indexHTML = try template.renderIndex(context: pageContext)
-            try indexHTML.data(using: .utf8)?.write(to: publicIndexPath)
-        }
-        reduceRebuildTasks()
+            let publicPlanet = PublicPlanetModel(
+                id: id,
+                name: name,
+                about: about,
+                ipns: ipns,
+                created: created,
+                updated: updated,
+                articles: publicArticles,
+                plausibleEnabled: plausibleEnabled,
+                plausibleDomain: plausibleDomain,
+                plausibleAPIServer: plausibleAPIServer,
+                juiceboxEnabled: juiceboxEnabled,
+                juiceboxProjectID: juiceboxProjectID,
+                juiceboxProjectIDGoerli: juiceboxProjectIDGoerli,
+                acceptsDonation: acceptsDonation,
+                acceptsDonationMessage: acceptsDonationMessage,
+                acceptsDonationETHAddress: acceptsDonationETHAddress,
+                twitterUsername: twitterUsername,
+                githubUsername: githubUsername,
+                telegramUsername: telegramUsername,
+                mastodonUsername: mastodonUsername,
+                discordLink: discordLink,
+                podcastCategories: podcastCategories,
+                podcastLanguage: podcastLanguage,
+                podcastExplicit: podcastExplicit,
+                tags: tags
+            )
+            let hasPodcastCoverArt = FileManager.default.fileExists(
+                atPath: publicPodcastCoverArtPath.path
+            )
 
-        // MARK: - Render tags
-        if let generateTagPages = template.generateTagPages, generateTagPages {
-            debugPrint("Generate tags for planet \(name)")
-            var tagArticles: [String: [PublicArticleModel]] = [:]
-            for article in allArticles {
-                if let articleTags = article.tags {
-                    for (key, _) in articleTags {
-                        if MyPlanetModel.isReservedTag(key) {
-                            continue
+            // MARK: - Render RSS, index, tags, and archive in parallel
+            let hasAvatar = self.hasAvatar()
+            let ogImageURL = ogImageURLString
+            let planetTags = self.tags
+            let reservedTagsRemoved = self.removeReservedTags()
+
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // MARK: RSS
+                group.addTask {
+                    let phaseStartedAt = Self.perfNow()
+                    self.renderRSS(podcastOnly: false)
+                    if publicPlanet.hasAudioContent() {
+                        self.renderRSS(podcastOnly: true)
+                    }
+                    self.reduceRebuildTasks()
+                    self.logPlanetPublicPerf(fields: [
+                        "phase=render_rss",
+                        "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                        "public_article_count=\(publicPlanet.articles.count)",
+                    ])
+                }
+
+                // MARK: Index pages
+                group.addTask {
+                    let phaseStartedAt = Self.perfNow()
+                    do {
+                        let itemsPerPage = template.idealItemsPerPage ?? 10
+                        let generateIndexPagination = template.generateIndexPagination ?? false
+                        let pageCount: Int
+                        if generateIndexPagination == true && publicPlanet.articles.count > itemsPerPage {
+                            let pages = Int(
+                                ceil(Double(publicPlanet.articles.count) / Double(itemsPerPage))
+                            )
+                            pageCount = pages
+                            debugPrint("Rendering \(pages) pages")
+                            try await withThrowingTaskGroup(of: Void.self) { innerGroup in
+                                for i in 1...pages {
+                                    let pageArticles = Array(
+                                        publicPlanet.articles[
+                                            (i - 1) * itemsPerPage..<min(
+                                                i * itemsPerPage,
+                                                publicPlanet.articles.count
+                                            )
+                                        ]
+                                    )
+                                    let pageContext: [String: Any] = [
+                                        "planet": publicPlanet,
+                                        "planet_ipns": self.ipns,
+                                        "my_planet": self,
+                                        "site_navigation": siteNavigation,
+                                        "has_avatar": hasAvatar,
+                                        "og_image_url": ogImageURL,
+                                        "has_podcast": publicPlanet.hasAudioContent(),
+                                        "has_podcast_cover_art": hasPodcastCoverArt,
+                                        "page": i,
+                                        "pages": pages,
+                                        "articles": pageArticles,
+                                    ]
+                                    innerGroup.addTask(priority: .userInitiated) {
+                                        let pageHTML = try template.renderIndex(context: pageContext)
+                                        let pagePath = self.publicIndexPagePath(page: i)
+                                        try pageHTML.data(using: .utf8)?.write(
+                                            to: pagePath,
+                                            options: .atomic
+                                        )
+                                    }
+
+                                    if i == 1 {
+                                        debugPrint("Build index.html: hasAvatar=\(hasAvatar)")
+                                        innerGroup.addTask(priority: .userInitiated) {
+                                            let indexHTML = try template.renderIndex(
+                                                context: pageContext
+                                            )
+                                            try indexHTML.data(using: .utf8)?.write(
+                                                to: self.publicIndexPath,
+                                                options: .atomic
+                                            )
+                                        }
+                                    }
+                                }
+                                try await innerGroup.waitForAll()
+                            }
                         }
-                        if tagArticles[key] == nil {
-                            tagArticles[key] = []
+                        else {
+                            pageCount = 1
+                            let pageContext: [String: Any] = [
+                                "planet": publicPlanet,
+                                "planet_ipns": self.ipns,
+                                "my_planet": self,
+                                "site_navigation": siteNavigation,
+                                "has_avatar": hasAvatar,
+                                "og_image_url": ogImageURL,
+                                "has_podcast": publicPlanet.hasAudioContent(),
+                                "has_podcast_cover_art": hasPodcastCoverArt,
+                                "articles": publicPlanet.articles,
+                            ]
+                            let pageHTML = try template.renderIndex(context: pageContext)
+                            let pagePath = self.publicIndexPagePath(page: 1)
+                            try pageHTML.data(using: .utf8)?.write(to: pagePath, options: .atomic)
+
+                            let indexHTML = try template.renderIndex(context: pageContext)
+                            try indexHTML.data(using: .utf8)?.write(
+                                to: self.publicIndexPath,
+                                options: .atomic
+                            )
                         }
-                        tagArticles[key]?.append(article)
+                        self.reduceRebuildTasks()
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_index",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            "pages=\(pageCount)",
+                            "public_article_count=\(publicPlanet.articles.count)",
+                        ])
+                    }
+                    catch {
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_index",
+                            "result=failure",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            Self.perfErrorField(error),
+                        ])
+                        throw error
                     }
                 }
-            }
-            for (key, value) in tagArticles {
-                let tagContext: [String: Any] = [
-                    "planet": publicPlanet,
-                    "planet_ipns": self.ipns,
-                    "my_planet": self,
-                    "site_navigation": siteNavigation,
-                    "has_avatar": self.hasAvatar(),
-                    "og_image_url": ogImageURLString,
-                    "has_podcast": publicPlanet.hasAudioContent(),
-                    "has_podcast_cover_art": hasPodcastCoverArt,
-                    "tag_key": key,
-                    "tag_value": self.tags?[key] ?? key,
-                    "current_item_type": "tags",
-                    "articles": value,
-                    "page_title": "\(self.name) - \(self.tags?[key] ?? key)",
-                ]
-                Task(priority: .userInitiated) {
-                    let tagHTML = try template.renderIndex(context: tagContext)
-                    let tagPath = publicTagPath(tag: key)
-                    try tagHTML.data(using: .utf8)?.write(to: tagPath)
-                }
-            }
-            if template.hasTagsHTML {
-                let tagsContext: [String: Any] = [
-                    "planet": publicPlanet,
-                    "planet_ipns": self.ipns,
-                    "my_planet": self,
-                    "site_navigation": siteNavigation,
-                    "has_avatar": self.hasAvatar(),
-                    "og_image_url": ogImageURLString,
-                    "has_podcast": publicPlanet.hasAudioContent(),
-                    "has_podcast_cover_art": hasPodcastCoverArt,
-                    "tags": self.removeReservedTags(),
-                    "tag_articles": tagArticles,
-                ]
-                Task(priority: .userInitiated) {
-                    let tagsHTML = try template.renderTags(context: tagsContext)
-                    try tagsHTML.data(using: .utf8)?.write(to: publicTagsPath)
-                }
-            }
-        }
-        else {
-            debugPrint("Skip generating tags for planet \(name)")
-        }
-        reduceRebuildTasks()
 
-        // MARK: - Render archive.html
-        if let generateArchive = template.generateArchive, generateArchive {
-            if template.hasArchiveHTML {
-                var archive: [String: [PublicArticleModel]] = [:]
-                var archiveSections: [String] = []
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "MMMM yyyy"
-                for article in allArticles {
-                    let monthYear = dateFormatter.string(from: article.created)
-                    if archive[monthYear] == nil {
-                        archive[monthYear] = []
-                        archiveSections.append(monthYear)
+                // MARK: Tags
+                group.addTask {
+                    let phaseStartedAt = Self.perfNow()
+                    do {
+                        var tagCount = 0
+                        var status = "skipped"
+                        if let generateTagPages = template.generateTagPages, generateTagPages {
+                            status = "rendered"
+                            debugPrint("Generate tags for planet \(self.name)")
+                            var tagArticles: [String: [PublicArticleModel]] = [:]
+                            for article in allArticles {
+                                if let articleTags = article.tags {
+                                    for (key, _) in articleTags {
+                                        if MyPlanetModel.isReservedTag(key) {
+                                            continue
+                                        }
+                                        if tagArticles[key] == nil {
+                                            tagArticles[key] = []
+                                        }
+                                        tagArticles[key]?.append(article)
+                                    }
+                                }
+                            }
+                            tagCount = tagArticles.count
+                            try await withThrowingTaskGroup(of: Void.self) { innerGroup in
+                                for (key, value) in tagArticles {
+                                    let tagContext: [String: Any] = [
+                                        "planet": publicPlanet,
+                                        "planet_ipns": self.ipns,
+                                        "my_planet": self,
+                                        "site_navigation": siteNavigation,
+                                        "has_avatar": hasAvatar,
+                                        "og_image_url": ogImageURL,
+                                        "has_podcast": publicPlanet.hasAudioContent(),
+                                        "has_podcast_cover_art": hasPodcastCoverArt,
+                                        "tag_key": key,
+                                        "tag_value": planetTags?[key] ?? key,
+                                        "current_item_type": "tags",
+                                        "articles": value,
+                                        "page_title": "\(self.name) - \(planetTags?[key] ?? key)",
+                                    ]
+                                    innerGroup.addTask(priority: .userInitiated) {
+                                        let tagHTML = try template.renderIndex(context: tagContext)
+                                        let tagPath = self.publicTagPath(tag: key)
+                                        try tagHTML.data(using: .utf8)?.write(
+                                            to: tagPath,
+                                            options: .atomic
+                                        )
+                                    }
+                                }
+                                if template.hasTagsHTML {
+                                    let tagsContext: [String: Any] = [
+                                        "planet": publicPlanet,
+                                        "planet_ipns": self.ipns,
+                                        "my_planet": self,
+                                        "site_navigation": siteNavigation,
+                                        "has_avatar": hasAvatar,
+                                        "og_image_url": ogImageURL,
+                                        "has_podcast": publicPlanet.hasAudioContent(),
+                                        "has_podcast_cover_art": hasPodcastCoverArt,
+                                        "tags": reservedTagsRemoved,
+                                        "tag_articles": tagArticles,
+                                    ]
+                                    innerGroup.addTask(priority: .userInitiated) {
+                                        let tagsHTML = try template.renderTags(context: tagsContext)
+                                        try tagsHTML.data(using: .utf8)?.write(
+                                            to: self.publicTagsPath,
+                                            options: .atomic
+                                        )
+                                    }
+                                }
+                                try await innerGroup.waitForAll()
+                            }
+                        }
+                        else {
+                            debugPrint("Skip generating tags for planet \(self.name)")
+                        }
+                        self.reduceRebuildTasks()
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_tags",
+                            "status=\(status)",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            "tag_count=\(tagCount)",
+                        ])
                     }
-                    archive[monthYear]?.append(article)
+                    catch {
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_tags",
+                            "result=failure",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            Self.perfErrorField(error),
+                        ])
+                        throw error
+                    }
                 }
-                let archiveContext: [String: Any] = [
-                    "planet": publicPlanet,
-                    "planet_ipns": self.ipns,
-                    "my_planet": self,
-                    "site_navigation": siteNavigation,
-                    "has_avatar": self.hasAvatar(),
-                    "og_image_url": ogImageURLString,
-                    "has_podcast": publicPlanet.hasAudioContent(),
-                    "has_podcast_cover_art": hasPodcastCoverArt,
-                    "articles": allArticles,
-                    "archive": archive,
-                    "archive_sections": archiveSections,
-                ]
-                let archiveHTML = try template.renderArchive(context: archiveContext)
-                try archiveHTML.data(using: .utf8)?.write(to: publicArchivePath)
+
+                // MARK: Archive
+                group.addTask {
+                    let phaseStartedAt = Self.perfNow()
+                    do {
+                        var status = "skipped"
+                        var archiveSectionCount = 0
+                        if let generateArchive = template.generateArchive, generateArchive {
+                            if template.hasArchiveHTML {
+                                status = "rendered"
+                                var archive: [String: [PublicArticleModel]] = [:]
+                                var archiveSections: [String] = []
+                                let dateFormatter = DateFormatter()
+                                dateFormatter.dateFormat = "MMMM yyyy"
+                                for article in allArticles {
+                                    let monthYear = dateFormatter.string(from: article.created)
+                                    if archive[monthYear] == nil {
+                                        archive[monthYear] = []
+                                        archiveSections.append(monthYear)
+                                    }
+                                    archive[monthYear]?.append(article)
+                                }
+                                archiveSectionCount = archiveSections.count
+                                let archiveContext: [String: Any] = [
+                                    "planet": publicPlanet,
+                                    "planet_ipns": self.ipns,
+                                    "my_planet": self,
+                                    "site_navigation": siteNavigation,
+                                    "has_avatar": hasAvatar,
+                                    "og_image_url": ogImageURL,
+                                    "has_podcast": publicPlanet.hasAudioContent(),
+                                    "has_podcast_cover_art": hasPodcastCoverArt,
+                                    "articles": allArticles,
+                                    "archive": archive,
+                                    "archive_sections": archiveSections,
+                                ]
+                                let archiveHTML = try template.renderArchive(context: archiveContext)
+                                try archiveHTML.data(using: .utf8)?.write(
+                                    to: self.publicArchivePath,
+                                    options: .atomic
+                                )
+                            }
+                        }
+                        else {
+                            debugPrint("Skip generating archive for planet \(self.name)")
+                        }
+                        self.reduceRebuildTasks()
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_archive",
+                            "status=\(status)",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            "archive_sections=\(archiveSectionCount)",
+                        ])
+                    }
+                    catch {
+                        self.logPlanetPublicPerf(fields: [
+                            "phase=render_archive",
+                            "result=failure",
+                            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                            Self.perfErrorField(error),
+                        ])
+                        throw error
+                    }
+                }
+
+                try await group.waitForAll()
             }
+
+            // MARK: - Save planet.json
+            phaseStartedAt = Self.perfNow()
+            do {
+                let info = try JSONEncoder.shared.encode(publicPlanet)
+                try info.write(to: publicInfoPath, options: .atomic)
+                logPlanetPublicPerf(fields: [
+                    "phase=write_planet_json",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    "public_article_count=\(publicPlanet.articles.count)",
+                ])
+            }
+            catch {
+                logPlanetPublicPerf(fields: [
+                    "phase=write_planet_json",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
+            }
+
+            // MARK: - Save robots.txt
+            phaseStartedAt = Self.perfNow()
+            saveRobotsTxt()
+            logPlanetPublicPerf(fields: [
+                "phase=write_robots_txt",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+            ])
+
+            // MARK: - Save template settings
+            phaseStartedAt = Self.perfNow()
+            writeTemplateSettings()
+            logPlanetPublicPerf(fields: [
+                "phase=write_template_settings",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+            ])
         }
-        else {
-            debugPrint("Skip generating archive for planet \(name)")
+        catch {
+            logPlanetPublicPerf(fields: [
+                "result=failure",
+                "total_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: totalStartedAt)))",
+                "attachments_check_status=\(attachmentsCheckStatus)",
+                "public_article_count=\(publicArticlesCount)",
+                Self.perfErrorField(error),
+            ])
+            throw error
         }
-        reduceRebuildTasks()
 
-        // MARK: - Save planet.json
-        let info = try JSONEncoder.shared.encode(publicPlanet)
-        try info.write(to: publicInfoPath)
-
-        // MARK: - Save robots.txt
-        saveRobotsTxt()
-
-        // MARK: - Save template settings
-        writeTemplateSettings()
+        logPlanetPublicPerf(fields: [
+            "result=success",
+            "total_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: totalStartedAt)))",
+            "attachments_check_status=\(attachmentsCheckStatus)",
+            "public_article_count=\(publicArticlesCount)",
+        ])
     }
 
     func saveRobotsTxt() {
@@ -1892,120 +2564,543 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         else {
             robotsTxt = ""
         }
-        try? robotsTxt.data(using: .utf8)?.write(to: publicRobotsTxtPath)
+        try? robotsTxt.data(using: .utf8)?.write(to: publicRobotsTxtPath, options: .atomic)
     }
 
-    func publish() async throws {
+    @MainActor
+    private func beginPublishingState() -> Bool {
+        if self.isPublishing {
+            return false
+        }
+        self.isPublishing = true
+        self.publishStartedAt = Date()
+        PlanetStatusManager.shared.updateStatus()
+        return true
+    }
+
+    @MainActor
+    private func finishPublishingState() -> Bool {
+        self.isPublishing = false
+        self.publishStartedAt = nil
+        PlanetStatusManager.shared.updateStatus()
+        guard self.queuedAutoPublishAfterRebuild else {
+            return false
+        }
+        self.queuedAutoPublishAfterRebuild = false
+        return true
+    }
+
+    @MainActor
+    private func beginRebuildState(taskCount: Int) {
+        self.isRebuilding = true
+        PlanetStore.shared.isRebuilding = true
+        PlanetStore.shared.rebuildTasks = taskCount
+        PlanetStatusManager.shared.updateStatus()
+    }
+
+    @MainActor
+    private func finishRebuildState() {
+        self.needsRebuild = false
+        self.isRebuilding = false
+        PlanetStore.shared.isRebuilding = false
+        PlanetStatusManager.shared.updateStatus()
+    }
+
+    private func drainQueuedAutoPublishAfterRebuildIfNeeded(_ shouldDrain: Bool) {
+        guard shouldDrain else {
+            return
+        }
+        debugPrint("Draining queued auto-publish after rebuild for \(name)")
+        Task.detached(priority: .background) {
+            do {
+                try await self.publish()
+            }
+            catch {
+                debugPrint("Queued auto-publish after rebuild failed for \(self.name): \(error)")
+            }
+        }
+    }
+
+    private func requestAutoPublishAfterRebuild(kind: String) async {
+        let startedAt = Self.perfNow()
+        let (status, shouldStartImmediately) = await MainActor.run { () -> (String, Bool) in
+            debugPrint("Auto-publish requested after rebuild for \(self.name)")
+            if self.isPublishing {
+                if self.queuedAutoPublishAfterRebuild {
+                    debugPrint("Auto-publish after rebuild already queued for \(self.name), coalescing")
+                    return ("coalesced", false)
+                }
+                else {
+                    debugPrint("Queueing auto-publish after rebuild for \(self.name)")
+                    self.queuedAutoPublishAfterRebuild = true
+                    return ("queued", false)
+                }
+            }
+            return ("started", true)
+        }
+        logRebuildPerf(kind: kind, fields: [
+            "phase=auto_publish_request",
+            "status=\(status)",
+            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: startedAt)))",
+        ])
+        guard shouldStartImmediately else {
+            return
+        }
+        Task.detached(priority: .background) {
+            do {
+                try await self.publish()
+            }
+            catch {
+                debugPrint("Auto-publish after rebuild failed for \(self.name): \(error)")
+            }
+        }
+    }
+
+    private func performPublish() async throws {
         if isRebuilding {
             debugPrint("Planet \(name) is being rebuilt, skipping publish")
             return
         }
-        await MainActor.run {
-            self.isPublishing = true
-            self.publishStartedAt = Date()
-            PlanetStatusManager.shared.updateStatus()
+        let shouldPublishIPNS = publishAsIPNS ?? true
+        let shouldPublishSSHRsync = sshRsyncEnabled ?? false
+        let rsyncDestination = Self.normalizedSSHRsyncDestination(sshRsyncDestination)
+        let shouldPublishCloudflarePages = cloudflarePagesEnabled ?? false
+
+        guard shouldPublishIPNS || shouldPublishSSHRsync || shouldPublishCloudflarePages else {
+            Self.logger.info("Skipping publish for planet \(self.name, privacy: .public)")
+            return
         }
-        // Make sure planet key is available in keystore or in keychain, abort publishing if not.
-        if try await !IPFSDaemon.shared.checkKeyExists(name: id.uuidString) {
-            try KeychainHelper.shared.importKeyFromKeychain(forPlanetKeyName: id.uuidString)
+        if shouldPublishSSHRsync {
+            guard let rsyncDestination, Self.isValidSSHRsyncDestination(rsyncDestination) else {
+                throw PlanetError.InvalidSSHRsyncDestinationError
+            }
         }
-        let cid = try await IPFSDaemon.shared.addDirectory(url: publicBasePath)
-        if cid.count == 0 {
-            throw PlanetError.PublishPlanetError
-        }
-        debugPrint("Publishing the latest CID for \(name): \(cid)")
-        // Send the latest CID to dWebServices.xyz if enabled
-        /*
-        if let dWebServicesEnabled = dWebServicesEnabled, dWebServicesEnabled,
-            let dWebServicesDomain = dWebServicesDomain, let dWebServicesAPIKey = dWebServicesAPIKey
-        {
-            debugPrint("dWebServices: about to update for \(dWebServicesDomain)")
-            let dWebRecord = dWebServices(domain: dWebServicesDomain, apiKey: dWebServicesAPIKey)
-            await dWebRecord.publish(cid: cid)
-        }
-        */
-        // Send the latest CID to Filebase if enabled
-        if let filebaseEnabled = filebaseEnabled, filebaseEnabled,
-            let filebasePinName = filebasePinName, let filebaseAPIToken = filebaseAPIToken
-        {
-            var toPin: Bool = false
-            if let existingCID = filebasePinCID {
-                if existingCID.count == 0 || existingCID != cid {
-                    toPin = true
+
+        var cid: String? = nil
+        if shouldPublishIPNS {
+            do {
+                logIPFS("[\(name)] Starting IPFS publish")
+                // Make sure planet key is available in keystore or in keychain, abort publishing if not.
+                if try await !IPFSDaemon.shared.checkKeyExists(name: id.uuidString) {
+                    try KeychainHelper.shared.importKeyFromKeychain(forPlanetKeyName: id.uuidString)
                 }
-            }
-            else {
-                toPin = true
-            }
-            if toPin {
-                Task.detached(priority: .userInitiated) {
-                    debugPrint("Filebase: about to pin for \(filebasePinName)")
-                    let filebase = Filebase(pinName: filebasePinName, apiToken: filebaseAPIToken)
-                    if let requestID = await filebase.pin(cid: cid) {
-                        Task { @MainActor in
-                            self.filebaseRequestID = requestID
-                            self.filebasePinCID = cid
-                            try? self.save()
+                let latestCID = try await IPFSDaemon.shared.addDirectory(url: publicBasePath)
+                if latestCID.count == 0 {
+                    logIPFS("[ERROR] [\(name)] Failed to prepare IPFS publish: empty CID")
+                    throw PlanetError.PublishPlanetError
+                }
+                cid = latestCID
+                logIPFS("[\(name)] Prepared CID \(latestCID)")
+                debugPrint("Publishing the latest CID for \(name): \(latestCID)")
+                // Send the latest CID to dWebServices.xyz if enabled
+                /*
+                if let dWebServicesEnabled = dWebServicesEnabled, dWebServicesEnabled,
+                    let dWebServicesDomain = dWebServicesDomain, let dWebServicesAPIKey = dWebServicesAPIKey
+                {
+                    debugPrint("dWebServices: about to update for \(dWebServicesDomain)")
+                    let dWebRecord = dWebServices(domain: dWebServicesDomain, apiKey: dWebServicesAPIKey)
+                    await dWebRecord.publish(cid: latestCID)
+                }
+                */
+                // Send the latest CID to Filebase if enabled
+                if let filebaseEnabled = filebaseEnabled, filebaseEnabled,
+                    let filebasePinName = filebasePinName, let filebaseAPIToken = filebaseAPIToken
+                {
+                    var toPin: Bool = false
+                    if let existingCID = filebasePinCID {
+                        if existingCID.count == 0 || existingCID != latestCID {
+                            toPin = true
                         }
+                    }
+                    else {
+                        toPin = true
+                    }
+                    if toPin {
+                        Task.detached(priority: .userInitiated) {
+                            debugPrint("Filebase: about to pin for \(filebasePinName)")
+                            let filebase = Filebase(pinName: filebasePinName, apiToken: filebaseAPIToken)
+                            if let requestID = await filebase.pin(cid: latestCID) {
+                                Task { @MainActor in
+                                    self.filebaseRequestID = requestID
+                                    self.filebasePinCID = latestCID
+                                    try? self.save()
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        debugPrint("Filebase: no need to pin for \(filebasePinName)")
                     }
                 }
             }
-            else {
-                debugPrint("Filebase: no need to pin for \(filebasePinName)")
+            catch {
+                logIPFS("[ERROR] [\(name)] IPFS publish preparation failed: \(String(describing: error))")
+                openIPFSLogWindow()
+                throw error
             }
         }
-        Task { @MainActor in
-            if cid != self.lastPublishedCID {
+
+        enum PublishTarget {
+            case ipns
+            case sshRsync
+            case cloudflarePages
+        }
+
+        var ipnsPublished = false
+        var sshRsyncPublished = false
+        var cloudflarePagesPublished = false
+        var ipnsError: Error? = nil
+        var sshRsyncError: Error? = nil
+        var cloudflarePagesError: Error? = nil
+
+        await withTaskGroup(of: (PublishTarget, Error?).self) { group in
+            if let cid {
+                group.addTask(priority: .userInitiated) {
+                    do {
+                        try await self.publishCIDToIPNS(cid: cid)
+                        return (.ipns, nil)
+                    }
+                    catch {
+                        return (.ipns, error)
+                    }
+                }
+            }
+            if shouldPublishSSHRsync, let rsyncDestination {
+                group.addTask(priority: .userInitiated) {
+                    do {
+                        try await self.publishViaSSHRsync(destination: rsyncDestination)
+                        return (.sshRsync, nil)
+                    }
+                    catch {
+                        return (.sshRsync, error)
+                    }
+                }
+            }
+            if shouldPublishCloudflarePages {
+                group.addTask(priority: .userInitiated) {
+                    do {
+                        try await self.publishViaCloudflarePages()
+                        return (.cloudflarePages, nil)
+                    }
+                    catch {
+                        return (.cloudflarePages, error)
+                    }
+                }
+            }
+            for await (target, error) in group {
+                switch target {
+                case .ipns:
+                    ipnsPublished = error == nil
+                    ipnsError = error
+                case .sshRsync:
+                    sshRsyncPublished = error == nil
+                    sshRsyncError = error
+                case .cloudflarePages:
+                    cloudflarePagesPublished = error == nil
+                    cloudflarePagesError = error
+                }
+            }
+        }
+
+        if let cid, ipnsPublished {
+            let shouldNotify = await MainActor.run {
+                cid != self.lastPublishedCID
+            }
+            try await MainActor.run {
                 self.lastPublished = Date()
                 self.lastPublishedCID = cid
                 try self.save()
-                Task {
+            }
+            if shouldNotify {
+                Task.detached(priority: .background) {
                     await self.sendNotificationForNewCID(cid: cid)
                 }
             }
+            Task.detached(priority: .background) {
+                await self.prewarm()
+            }
+            Task.detached(priority: .background) {
+                await self.callPinnable()
+            }
         }
-        if #available(macOS 13.0, *) {
-            let publishStartTime = Date()
-            Task { @MainActor in
-                try? await Task.sleep(for: .seconds(10))
-                if self.isPublishing && publishStartTime.timeIntervalSinceNow < -9 {
-                    debugPrint("Planet publish is still running")
-                    self.isPublishing = false
-                    PlanetStatusManager.shared.updateStatus()
+        else if sshRsyncPublished || cloudflarePagesPublished {
+            try await MainActor.run {
+                self.lastPublished = Date()
+                try self.save()
+            }
+        }
+
+        if let ipnsError {
+            logIPFS("[ERROR] [\(name)] IPNS publish failed: \(String(describing: ipnsError))")
+            openIPFSLogWindow()
+            throw ipnsError
+        }
+        if let sshRsyncError {
+            throw sshRsyncError
+        }
+        if let cloudflarePagesError {
+            throw cloudflarePagesError
+        }
+    }
+
+    func publish() async throws {
+        let startedPublishing = await MainActor.run {
+            self.beginPublishingState()
+        }
+        if !startedPublishing {
+            debugPrint("Planet \(name) is already publishing, skipping")
+            return
+        }
+
+        var publishError: Error? = nil
+        do {
+            try await self.performPublish()
+        }
+        catch {
+            publishError = error
+        }
+
+        let shouldDrainQueuedAutoPublish = await MainActor.run {
+            self.finishPublishingState()
+        }
+        drainQueuedAutoPublishAfterRebuildIfNeeded(shouldDrainQueuedAutoPublish)
+
+        if let publishError {
+            throw publishError
+        }
+    }
+
+    func publishIPNSKeepAlive() async throws {
+        guard publishAsIPNS ?? true else {
+            Self.logger.info(
+                "Skipping scheduled IPNS keepalive for planet \(self.name, privacy: .public)"
+            )
+            return
+        }
+        let startedPublishing = await MainActor.run {
+            self.beginPublishingState()
+        }
+        if !startedPublishing {
+            debugPrint("Planet \(name) is already publishing, skipping scheduled IPNS keepalive")
+            return
+        }
+
+        var keepAliveError: Error? = nil
+        do {
+            if isRebuilding {
+                debugPrint("Planet \(name) is being rebuilt, skipping scheduled IPNS keepalive")
+            }
+            else {
+                logIPFS("[\(name)] Starting IPNS keepalive")
+                if try await !IPFSDaemon.shared.checkKeyExists(name: id.uuidString) {
+                    try KeychainHelper.shared.importKeyFromKeychain(forPlanetKeyName: id.uuidString)
+                }
+
+                let cid: String
+                if let lastPublishedCID, !lastPublishedCID.isEmpty {
+                    cid = lastPublishedCID
                 } else {
-                    debugPrint("Planet publish is done")
+                    let latestCID = try await IPFSDaemon.shared.addDirectory(url: publicBasePath)
+                    if latestCID.isEmpty {
+                        throw PlanetError.PublishPlanetError
+                    }
+                    cid = latestCID
+                }
+
+                try await publishCIDToIPNS(cid: cid)
+                try await MainActor.run {
+                    self.lastPublished = Date()
+                    if self.lastPublishedCID?.isEmpty != false {
+                        self.lastPublishedCID = cid
+                    }
+                    try self.save()
+                }
+                logIPFS("[\(name)] Refreshed IPNS keepalive for CID \(cid)")
+                Self.logger.info("Refreshed IPNS keepalive for planet \(self.name, privacy: .public)")
+            }
+        }
+        catch PlanetError.IPFSAPIError {
+            keepAliveError = PlanetError.IPFSAPIError
+        }
+        catch {
+            keepAliveError = error
+        }
+
+        let shouldDrainQueuedAutoPublish = await MainActor.run {
+            self.finishPublishingState()
+        }
+        drainQueuedAutoPublishAfterRebuildIfNeeded(shouldDrainQueuedAutoPublish)
+
+        if let keepAliveError {
+            if let planetError = keepAliveError as? PlanetError, case .IPFSAPIError = planetError {
+                logIPFS("[WARNING] [\(name)] IPNS keepalive failed: \(PlanetError.IPFSAPIError)")
+            }
+            else {
+                logIPFS("[ERROR] [\(name)] IPNS keepalive failed: \(String(describing: keepAliveError))")
+                openIPFSLogWindow()
+            }
+            throw keepAliveError
+        }
+    }
+
+    private func publishCIDToIPNS(cid: String) async throws {
+        logIPFS("[\(name)] Publishing CID \(cid) to IPNS")
+        let result = try await IPFSDaemon.shared.api(
+            path: "name/publish",
+            args: [
+                "arg": cid,
+                "allow-offline": "1",
+                "key": self.id.uuidString,
+                "quieter": "1",
+                "lifetime": "7200h",
+            ],
+            timeout: 180
+        )
+        let published = try JSONDecoder.shared.decode(IPFSPublished.self, from: result)
+        logIPFS("[\(name)] Published to \(published.name): \(cid)")
+        Self.logger.info("Published planet \(published.name): \(cid)")
+    }
+
+    private func logIPFS(_ message: String) {
+        IPFSLogger.log(message)
+    }
+
+    private func openIPFSLogWindow() {
+        Task { @MainActor in
+            AppLogWindowManager.shared.openOnError(tab: .ipfs)
+        }
+    }
+
+    private func publishViaSSHRsync(destination: String) async throws {
+        let source = publicBasePath.path + "/"
+        var sshOptions = "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        if sshRsyncKeyPath != nil,
+           FileManager.default.fileExists(atPath: sshRsyncKeyStorePath.path)
+        {
+            sshOptions += " -o IdentityFile=\(sshRsyncKeyStorePath.path) -o IdentitiesOnly=yes"
+        }
+        var rsyncArgs = ["-a"]
+        if sshRsyncDeleteEnabled ?? false {
+            rsyncArgs.append("--delete")
+        }
+        rsyncArgs += ["-e", sshOptions, source, destination]
+        let command = "rsync \(rsyncArgs.joined(separator: " "))"
+        SSHRsyncLogger.log("[\(name)] Starting: \(command)")
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            final class ContinuationState: @unchecked Sendable {
+                private let lock = NSLock()
+                private var continuation: CheckedContinuation<Void, Error>?
+
+                init(_ continuation: CheckedContinuation<Void, Error>) {
+                    self.continuation = continuation
+                }
+
+                func finish(_ result: Result<Void, Error>) {
+                    lock.lock()
+                    let continuation = self.continuation
+                    self.continuation = nil
+                    lock.unlock()
+                    continuation?.resume(with: result)
                 }
             }
-        }
-        Task.detached(priority: .userInitiated) {
-            let result = try await IPFSDaemon.shared.api(
-                path: "name/publish",
-                args: [
-                    "arg": cid,
-                    "allow-offline": "1",
-                    "key": self.id.uuidString,
-                    "quieter": "1",
-                    "lifetime": "7200h",
-                ],
-                timeout: 180
-            )
-            let published = try JSONDecoder.shared.decode(IPFSPublished.self, from: result)
-            Self.logger.info("Published planet \(published.name): \(cid)")
-            await MainActor.run {
-                self.isPublishing = false
-                self.publishStartedAt = nil
-                PlanetStatusManager.shared.updateStatus()
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
+            process.arguments = rsyncArgs
+
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            process.standardOutput = stdoutPipe
+            process.standardError = stderrPipe
+
+            let continuationState = ContinuationState(continuation)
+            let finish: @Sendable (Result<Void, Error>) -> Void = { result in
+                continuationState.finish(result)
+            }
+
+            process.terminationHandler = { process in
+                let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile().logFormat().trim()
+                let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile().logFormat().trim()
+
+                guard process.terminationStatus == 0 else {
+                    let details = stderr.isEmpty ? stdout : stderr
+                    let message = details.isEmpty
+                        ? "SSH rsync failed with exit code \(process.terminationStatus)."
+                        : "SSH rsync failed: \(details)"
+                    SSHRsyncLogger.log("[ERROR] [\(self.name)] \(message)")
+                    Self.logger.error(
+                        "SSH rsync publish failed for planet \(self.name, privacy: .public): \(message, privacy: .public)"
+                    )
+                    Task { @MainActor in
+                        AppLogWindowManager.shared.openOnError(tab: .sshRsync)
+                    }
+                    finish(.failure(PlanetError.SSHRsyncPublishError(message)))
+                    return
+                }
+
+                SSHRsyncLogger.log("[\(self.name)] Published to \(destination)")
+                Self.logger.info(
+                    "Published planet \(self.name, privacy: .public) via SSH rsync to \(destination, privacy: .public)"
+                )
+                finish(.success(()))
+            }
+
+            do {
+                try process.run()
+            }
+            catch {
+                SSHRsyncLogger.log("[ERROR] [\(self.name)] Failed to launch rsync: \(error.localizedDescription)")
+                Task { @MainActor in
+                    AppLogWindowManager.shared.openOnError(tab: .sshRsync)
+                }
+                finish(.failure(error))
             }
         }
-        Task.detached(priority: .background) {
-            await self.prewarm()
+    }
+
+    private func publishViaCloudflarePages() async throws {
+        guard let accountID = cloudflarePagesAccountID, !accountID.isEmpty,
+              let apiToken = cloudflarePagesAPIToken, !apiToken.isEmpty,
+              let projectName = cloudflarePagesProjectName, !projectName.isEmpty
+        else {
+            let message = L10n("Cloudflare Pages is enabled but Account ID, API Token, or Project Name is missing.")
+            CloudflarePagesLogger.log("[ERROR] [\(name)] \(message)")
+            throw PlanetError.CloudflarePagesPublishError(message)
         }
-        Task.detached(priority: .background) {
-            await self.callPinnable()
+        CloudflarePagesLogger.log("[\(name)] Starting deployment to project '\(projectName)'")
+        do {
+            let cf = CloudflarePages(accountID: accountID, apiToken: apiToken, projectName: projectName)
+            let siteURL = try await cf.deploy(directoryURL: publicBasePath)
+            if let siteURL {
+                try await MainActor.run {
+                    self.cloudflarePagesLastDeployedProjectName = projectName
+                    self.cloudflarePagesLastDeployedURL = siteURL.absoluteString
+                    try self.save()
+                }
+                CloudflarePagesLogger.log("[\(name)] Published to \(siteURL.absoluteString)")
+            } else {
+                CloudflarePagesLogger.log(
+                    "[WARNING] [\(name)] Published successfully, but the deployment response did not include a stable production Pages URL."
+                )
+            }
+            Self.logger.info(
+                "Published planet \(self.name, privacy: .public) via Cloudflare Pages to project \(projectName, privacy: .public)"
+            )
+        }
+        catch {
+            CloudflarePagesLogger.log("[ERROR] [\(name)] \(error.localizedDescription)")
+            Self.logger.error(
+                "Cloudflare Pages publish failed for planet \(self.name, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            Task { @MainActor in
+                AppLogWindowManager.shared.openOnError(tab: .cloudflarePages)
+            }
+            throw error
         }
     }
 
     func prewarm() async {
+        guard publishAsIPNS ?? true else { return }
         guard let rootURL = browserURL else { return }
 
         // Helper function to prewarm a single URL
@@ -2093,6 +3188,8 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             about: about,
             domain: domain,
             authorName: authorName,
+            slug: slug,
+            nextArticleNumber: nextArticleNumber,
             ipns: ipns,
             created: created,
             updated: updated,
@@ -2133,9 +3230,6 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             juiceboxEnabled: juiceboxEnabled,
             juiceboxProjectID: juiceboxProjectID,
             juiceboxProjectIDGoerli: juiceboxProjectIDGoerli,
-            farcasterEnabled: farcasterEnabled,
-            farcasterUsername: farcasterUsername,
-            farcasterJSON: farcasterJSON,
             acceptsDonation: acceptsDonation,
             acceptsDonationMessage: acceptsDonationMessage,
             acceptsDonationETHAddress: acceptsDonationETHAddress,
@@ -2145,6 +3239,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                     articleType: $0.articleType,
                     link: $0.link,
                     slug: $0.slug,
+                    articleNumber: $0.articleNumber,
                     heroImage: $0.heroImage,
                     heroImageWidth: $0.heroImageWidth,
                     heroImageHeight: $0.heroImageHeight,
@@ -2156,6 +3251,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                     starred: $0.starred,
                     starType: $0.starType,
                     created: $0.created,
+                    modified: $0.modified,
                     videoFilename: $0.videoFilename,
                     audioFilename: $0.audioFilename,
                     attachments: $0.attachments,
@@ -2175,7 +3271,18 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             reuseOriginalID: reuseOriginalID,
             saveRoundAvatar: saveRoundAvatar,
             doNotIndex: doNotIndex,
-            prewarmNewPost: prewarmNewPost
+            prewarmNewPost: prewarmNewPost,
+            publishAsIPNS: publishAsIPNS,
+            sshRsyncEnabled: sshRsyncEnabled,
+            sshRsyncDestination: Self.normalizedSSHRsyncDestination(sshRsyncDestination),
+            sshRsyncKeyPath: sshRsyncKeyPath,
+            sshRsyncDeleteEnabled: sshRsyncDeleteEnabled,
+            cloudflarePagesEnabled: cloudflarePagesEnabled,
+            cloudflarePagesAccountID: cloudflarePagesAccountID,
+            cloudflarePagesAPIToken: cloudflarePagesAPIToken,
+            cloudflarePagesProjectName: cloudflarePagesProjectName,
+            cloudflarePagesLastDeployedProjectName: cloudflarePagesLastDeployedProjectName,
+            cloudflarePagesLastDeployedURL: cloudflarePagesLastDeployedURL
         )
         do {
             try FileManager.default.copyItem(at: publicBasePath, to: exportPath)
@@ -2199,7 +3306,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
                 isDirectory: false
             )
             let backupPlanet = try JSONEncoder.shared.encode(backupPlanet)
-            try backupPlanet.write(to: backupPlanetInfoPath)
+            try backupPlanet.write(to: backupPlanetInfoPath, options: .atomic)
         }
         catch {
             debugPrint("Export Planet error: \(error)")
@@ -2212,7 +3319,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     }
 
     func save() throws {
-        try JSONEncoder.shared.encode(self).write(to: infoPath)
+        try JSONEncoder.shared.encode(self).write(to: infoPath, options: .atomic)
     }
 
     func archive() {
@@ -2224,6 +3331,7 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     }
 
     func delete() throws {
+        PlanetStore.removeSpotlightItems(forPlanetID: id)
         try FileManager.default.removeItem(at: basePath)
         try FileManager.default.removeItem(at: publicBasePath)
         Task(priority: .utility) {
@@ -2237,18 +3345,40 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
         }
     }
 
+    func opDate(for key: String) -> Date? {
+        opsLock.lock()
+        defer { opsLock.unlock() }
+        return ops[key]
+    }
+
+    func recordOp(_ key: String, at date: Date = Date()) {
+        opsLock.lock()
+        ops[key] = date
+        opsLock.unlock()
+    }
+
+    private func replaceOps(_ newOps: [String: Date]) {
+        opsLock.lock()
+        ops = newOps
+        opsLock.unlock()
+    }
+
     func saveOps() throws {
-        try JSONEncoder.shared.encode(self.ops).write(to: opsPath)
+        opsLock.lock()
+        defer { opsLock.unlock() }
+        let opsData = try JSONEncoder.shared.encode(ops)
+        try opsData.write(to: opsPath, options: .atomic)
     }
 
     func loadOps() throws {
         do {
             if !FileManager.default.fileExists(atPath: opsPath.path) {
-                self.ops = [:]
+                replaceOps([:])
                 return
             }
             let opsData = try Data(contentsOf: opsPath)
-            self.ops = try JSONDecoder.shared.decode([String: Date].self, from: opsData)
+            let decodedOps = try JSONDecoder.shared.decode([String: Date].self, from: opsData)
+            replaceOps(decodedOps)
         }
         catch {
             debugPrint("failed to load ops from file: \(error)")
@@ -2275,72 +3405,142 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     }
 
     func rebuild() async throws {
-        let started = Date()
+        let kind = "full"
+        let startedAt = Self.perfNow()
+        logRebuildPerf(kind: kind, fields: ["event=start"])
+        let templateSettingsWarmupTask = Task(priority: .userInitiated) {
+            self.warmTemplateSettingsAndFiltersCache()
+        }
+
+        var phaseStartedAt = Self.perfNow()
         await MainActor.run {
-            self.isRebuilding = true
+            self.beginRebuildState(taskCount: self.articles.count + 5)
         }
-        defer {
-            Task { @MainActor in
-                self.needsRebuild = false
-                self.isRebuilding = false
-                PlanetStatusManager.shared.updateStatus()
-            }
-        }
-        Task { @MainActor in
-            PlanetStore.shared.isRebuilding = true
-            PlanetStore.shared.rebuildTasks = self.articles.count
-            PlanetStatusManager.shared.updateStatus()
-        }
-        try self.copyTemplateAssets()
+        logRebuildPerf(kind: kind, fields: [
+            "phase=begin_rebuild_state",
+            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+        ])
 
-        // according to benchmarks, using parallel processing would take half the time to rebuild
-
-        // heaviest task is generating thumbnails
-
-        // try self.articles.forEach { try $0.savePublic(usingTasks: true) }
-
+        var rebuildError: Error? = nil
         do {
-            // split the articles into groups
-            let cpuCount = ProcessInfo.processInfo.activeProcessorCount
-            let articleGroups = self.articles.chunked(into: cpuCount > 8 ? 8 : cpuCount)
-            for articleGroup in articleGroups {
-                /* TaskGroup */
+            phaseStartedAt = Self.perfNow()
+            do {
+                try self.copyTemplateAssets()
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=copy_template_assets",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                ])
+            }
+            catch {
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=copy_template_assets",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
+            }
+            reduceRebuildTasks()
+
+            // according to benchmarks, using parallel processing would take half the time to rebuild
+
+            // heaviest task is generating thumbnails
+            await templateSettingsWarmupTask.value
+
+            phaseStartedAt = Self.perfNow()
+            do {
+                let articles = self.articles ?? []
+                let workerCount = max(
+                    1,
+                    min(ProcessInfo.processInfo.activeProcessorCount, articles.count)
+                )
+                let chunkSize = max(1, (articles.count + workerCount - 1) / workerCount)
                 try await withThrowingTaskGroup(of: Void.self) { group in
-                    for article in articleGroup {
+                    // Cap concurrent article renders to avoid oversubscribing CPU-bound template work.
+                    for start in stride(from: 0, to: articles.count, by: chunkSize) {
+                        let end = min(start + chunkSize, articles.count)
                         group.addTask(priority: .high) {
-                            try article.savePublic(usingTasks: true)
+                            for index in start..<end {
+                                try articles[index].savePublicConcurrently()
+                            }
                         }
                     }
                     try await group.waitForAll()
                 }
-            }
-        }
-        Task { @MainActor in
-            isRebuilding = false
-            PlanetStore.shared.isRebuilding = false
-        }
-        let ended = Date()
-        let timeInterval = ended.timeIntervalSince(started)
-        debugPrint("Rebuild planet: \(name) took \(String(format: "%.3f", timeInterval)) seconds")
-        Task {
-            do {
-                try self.saveOps()
-                debugPrint("saved ops.json")
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=article_batch",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                ])
             }
             catch {
-                debugPrint("failed to save ops to file: \(error)")
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=article_batch",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
             }
+            saveOpsInBackground(kind: kind)
+
+            phaseStartedAt = Self.perfNow()
+            do {
+                try await self.savePublic()
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=save_public_total",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                ])
+            }
+            catch {
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=save_public_total",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
+            }
+            NotificationCenter.default.post(name: .loadArticle, object: nil)
         }
-        try await self.savePublic()
-        NotificationCenter.default.post(name: .loadArticle, object: nil)
+        catch {
+            rebuildError = error
+        }
+
+        phaseStartedAt = Self.perfNow()
+        await MainActor.run {
+            self.finishRebuildState()
+        }
+        logRebuildPerf(kind: kind, fields: [
+            "phase=finish_rebuild_state",
+            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+        ])
+
+        let totalDuration = Self.perfElapsed(since: startedAt)
+        debugPrint(
+            "Rebuild planet: \(name) took \(String(format: "%.3f", Double(totalDuration) / 1_000_000_000)) seconds"
+        )
+        if let rebuildError {
+            logRebuildPerf(kind: kind, fields: [
+                "event=finish",
+                "result=failure",
+                "total_ms=\(PerfLogger.milliseconds(totalDuration))",
+                Self.perfErrorField(rebuildError),
+            ])
+            throw rebuildError
+        }
+        logRebuildPerf(kind: kind, fields: [
+            "event=finish",
+            "result=success",
+            "total_ms=\(PerfLogger.milliseconds(totalDuration))",
+        ])
         Task { @MainActor in
-            NotificationCenter.default.post(name: .publishMyPlanet, object: self)
             // Update Planet Lite Window Titles
             let liteSubtitle = "ipns://\(self.ipns.shortIPNS())"
             let info = ["title": self.name, "subtitle": liteSubtitle]
             NotificationCenter.default.post(name: .updatePlanetLiteWindowTitles, object: info)
         }
-        await sendNotificationForRebuild()
+        await requestAutoPublishAfterRebuild(kind: kind)
+        await sendNotificationForRebuild(kind: kind)
     }
 
     func quickRebuildTaskCount() -> Int {
@@ -2363,63 +3563,111 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
     }
 
     func quickRebuild() async throws {
-        let started = Date()
+        let kind = "quick"
+        let startedAt = Self.perfNow()
+        logRebuildPerf(kind: kind, fields: ["event=start"])
+        let templateSettingsWarmupTask = Task(priority: .userInitiated) {
+            self.warmTemplateSettingsAndFiltersCache()
+        }
+
+        var phaseStartedAt = Self.perfNow()
         await MainActor.run {
-            self.isRebuilding = true
+            self.beginRebuildState(taskCount: quickRebuildTaskCount())
         }
-        defer {
-            Task { @MainActor in
-                self.needsRebuild = false
-                self.isRebuilding = false
-                PlanetStatusManager.shared.updateStatus()
-            }
-        }
-        Task { @MainActor in
-            PlanetStore.shared.isRebuilding = true
-            PlanetStore.shared.rebuildTasks = quickRebuildTaskCount()
-            PlanetStatusManager.shared.updateStatus()
-        }
-        try self.copyTemplateAssets()
-        reduceRebuildTasks()
-        try await self.savePublic()
-        await MainActor.run {
-            self.isRebuilding = false
-        }
-        Task { @MainActor in
-            PlanetStore.shared.isRebuilding = false
-        }
-        Task {
+        logRebuildPerf(kind: kind, fields: [
+            "phase=begin_rebuild_state",
+            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+        ])
+
+        var rebuildError: Error? = nil
+        do {
+            phaseStartedAt = Self.perfNow()
             do {
-                try self.saveOps()
+                try self.copyTemplateAssets()
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=copy_template_assets",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                ])
             }
             catch {
-                debugPrint("failed to save ops to file: \(error)")
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=copy_template_assets",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
             }
+            reduceRebuildTasks()
+            await templateSettingsWarmupTask.value
+            phaseStartedAt = Self.perfNow()
+            do {
+                try await self.savePublic()
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=save_public_total",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                ])
+            }
+            catch {
+                logRebuildPerf(kind: kind, fields: [
+                    "phase=save_public_total",
+                    "result=failure",
+                    "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+                    Self.perfErrorField(error),
+                ])
+                throw error
+            }
+            saveOpsInBackground(kind: kind)
+            NotificationCenter.default.post(name: .loadArticle, object: nil)
         }
-        Task { @MainActor in
-            PlanetStore.shared.rebuildTasks = 0
-            NotificationCenter.default.post(name: .myArticleBuilt, object: nil)
+        catch {
+            rebuildError = error
         }
-        let ended = Date()
-        let timeInterval = ended.timeIntervalSince(started)
-        debugPrint("Quick Rebuild planet: \(name) took \(timeInterval) seconds")
-        NotificationCenter.default.post(name: .loadArticle, object: nil)
+
+        phaseStartedAt = Self.perfNow()
+        await MainActor.run {
+            self.finishRebuildState()
+        }
+        logRebuildPerf(kind: kind, fields: [
+            "phase=finish_rebuild_state",
+            "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: phaseStartedAt)))",
+        ])
+
+        let totalDuration = Self.perfElapsed(since: startedAt)
+        debugPrint(
+            "Quick Rebuild planet: \(name) took \(String(format: "%.3f", Double(totalDuration) / 1_000_000_000)) seconds"
+        )
+        if let rebuildError {
+            logRebuildPerf(kind: kind, fields: [
+                "event=finish",
+                "result=failure",
+                "total_ms=\(PerfLogger.milliseconds(totalDuration))",
+                Self.perfErrorField(rebuildError),
+            ])
+            throw rebuildError
+        }
+        logRebuildPerf(kind: kind, fields: [
+            "event=finish",
+            "result=success",
+            "total_ms=\(PerfLogger.milliseconds(totalDuration))",
+        ])
         Task { @MainActor in
-            NotificationCenter.default.post(name: .publishMyPlanet, object: self)
             // Update Planet Lite Window Titles
             let liteSubtitle = "ipns://\(self.ipns.shortIPNS())"
             let info = ["title": self.name, "subtitle": liteSubtitle]
             NotificationCenter.default.post(name: .updatePlanetLiteWindowTitles, object: info)
         }
+        await requestAutoPublishAfterRebuild(kind: kind)
         Task.detached(priority: .background) {
             await self.prewarm()
         }
-        await sendNotificationForRebuild()
+        await sendNotificationForRebuild(kind: kind)
     }
 
-    func sendNotificationForRebuild() async {
+    func sendNotificationForRebuild(kind: String) async {
+        let startedAt = Self.perfNow()
         let notification = UNMutableNotificationContent()
-        notification.title = "Planet Rebuilt"
+        notification.title = L10n("Planet Rebuilt")
         notification.subtitle = self.name
         notification.interruptionLevel = .active
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
@@ -2428,13 +3676,28 @@ class MyPlanetModel: Equatable, Hashable, Identifiable, ObservableObject, Codabl
             content: notification,
             trigger: trigger
         )
-        try? await UNUserNotificationCenter.current().add(request)
+        do {
+            try await UNUserNotificationCenter.current().add(request)
+            logRebuildPerf(kind: kind, fields: [
+                "phase=notification",
+                "result=success",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: startedAt)))",
+            ])
+        }
+        catch {
+            logRebuildPerf(kind: kind, fields: [
+                "phase=notification",
+                "result=failure",
+                "duration_ms=\(PerfLogger.milliseconds(Self.perfElapsed(since: startedAt)))",
+                Self.perfErrorField(error),
+            ])
+        }
     }
 
     func sendNotificationForNewCID(cid: String) async {
         let notification = UNMutableNotificationContent()
         notification.title = self.name + ": Planet Published"
-        notification.subtitle = "CID: " + cid
+        notification.subtitle = L10n("CID: ") + cid
 
         if FileManager.default.fileExists(atPath: publicAvatarPath.path) {
             // Copy the avatar to the temporary directory
@@ -2514,14 +3777,14 @@ extension MyPlanetModel {
     func navigationSubtitle() -> String {
         if articles.count > 0 {
             if articles.count > 1 {
-                return "\(articles.count) articles"
+                return L10n("%d articles", articles.count)
             }
             else {
-                return "1 article"
+                return L10n("1 article")
             }
         }
         else {
-            return "No articles"
+            return L10n("No articles")
         }
     }
 

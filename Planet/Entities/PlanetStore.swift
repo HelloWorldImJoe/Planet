@@ -33,16 +33,119 @@ enum PlanetDetailViewType: Hashable, Equatable {
             return "followingPlanet:\(planet.id.uuidString)"
         }
     }
+
+    static func == (lhs: PlanetDetailViewType, rhs: PlanetDetailViewType) -> Bool {
+        switch (lhs, rhs) {
+        case (.today, .today), (.unread, .unread), (.starred, .starred):
+            return true
+        case (.myPlanet(let lhsPlanet), .myPlanet(let rhsPlanet)):
+            return lhsPlanet.id == rhsPlanet.id
+        case (.followingPlanet(let lhsPlanet), .followingPlanet(let rhsPlanet)):
+            return lhsPlanet.id == rhsPlanet.id
+        default:
+            return false
+        }
+    }
+
+    func hash(into hasher: inout Hasher) {
+        switch self {
+        case .today:
+            hasher.combine(0)
+        case .unread:
+            hasher.combine(1)
+        case .starred:
+            hasher.combine(2)
+        case .myPlanet(let planet):
+            hasher.combine(3)
+            hasher.combine(planet.id)
+        case .followingPlanet(let planet):
+            hasher.combine(4)
+            hasher.combine(planet.id)
+        }
+    }
+}
+
+final class MyJSONDirectoryMonitor {
+    private var stream: FSEventStreamRef?
+    private let callback: FSEventStreamCallback = { (_, contextInfo, numEvents, eventPaths, _, _) in
+        guard let contextInfo else { return }
+        let monitor = Unmanaged<MyJSONDirectoryMonitor>.fromOpaque(contextInfo).takeUnretainedValue()
+        let pathsArray = unsafeBitCast(eventPaths, to: NSArray.self)
+        var changedPaths: [String] = []
+        for idx in 0..<Int(numEvents) {
+            if let path = pathsArray[idx] as? String {
+                changedPaths.append(path)
+            }
+        }
+        monitor.changed(changedPaths)
+    }
+    private let directory: String
+    private let changed: ([String]) -> Void
+
+    init(directory: String, changed: @escaping ([String]) -> Void) {
+        self.directory = directory
+        self.changed = changed
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        stop()
+        let pathsToWatch: CFArray = [directory] as CFArray
+        var context = FSEventStreamContext(
+            version: 0,
+            info: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            callback,
+            &context,
+            pathsToWatch,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.5,
+            UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagIgnoreSelf)
+        )
+        guard let stream else { return }
+        FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        FSEventStreamStart(stream)
+    }
+
+    func stop() {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
+    }
 }
 
 @MainActor class PlanetStore: ObservableObject {
     static let shared = PlanetStore()
     static let version = 1
+    nonisolated(unsafe) static var isSharedReady = false
 
     let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "PlanetStore")
+    private var myDataMonitor: MyJSONDirectoryMonitor?
+    private var myDataReloadTask: Task<Void, Never>?
+    private var myDataReloadInProgress = false
+    private var selectedViewRefreshTask: Task<Void, Never>?
+    private var pendingArticleRestoreID: UUID?
+    private var pendingSidebarScroll = false
+    var cachedSearchSnapshots: [SearchArticleSnapshot] = []
+    var pendingIndexUpdates: Int = 0
+    var searchIndexBuiltOnce = false
+    var embeddingRebuildTask: Task<Void, Never>?
+    var spotlightRebuildTask: Task<Bool, Never>?
+    var spotlightLaunchMarkerLogged = false
 
     @Published var myPlanets: [MyPlanetModel] = [] {
         didSet {
+            updateTotalStarredCount()
             let planets = myPlanets
             Task.detached {
                 await MainActor.run {
@@ -55,6 +158,9 @@ enum PlanetDetailViewType: Hashable, Equatable {
 
     @Published var followingPlanets: [FollowingPlanetModel] = [] {
         didSet {
+            updateTotalUnreadCount()
+            updateTotalTodayCount()
+            updateTotalStarredCount()
             Task { @MainActor in
                 ArticleWebViewModel.shared.updateFollowingPlanets(followingPlanets)
             }
@@ -67,30 +173,68 @@ enum PlanetDetailViewType: Hashable, Equatable {
 
     @Published var selectedView: PlanetDetailViewType? {
         didSet {
+            let canonicalView = canonicalSelectedView(selectedView)
+            if selectedView != canonicalView {
+                selectedView = canonicalView
+                return
+            }
             if selectedView != oldValue {
-                Task { @MainActor in
-                    self.selectedArticle = nil
-                }
-                refreshSelectedArticles()
-                UserDefaults.standard.set(selectedView?.stringValue, forKey: "lastSelectedView")
+                let selectedViewSnapshot = selectedView
+                selectedViewRefreshTask?.cancel()
+                selectedViewRefreshTask = Task { @MainActor in
+                    // Defer publishes to the next main-actor turn to avoid SwiftUI re-entrancy warnings.
+                    await Task.yield()
+                    guard !Task.isCancelled, self.selectedView == selectedViewSnapshot else {
+                        return
+                    }
+                    self.refreshSelectedArticles()
 
-                Task { @MainActor in
-                    switch selectedView {
+                    switch self.selectedView {
                     case .myPlanet(let planet):
-                        KeyboardShortcutHelper.shared.activeMyPlanet = planet
+                        let canonicalPlanet = self.myPlanets.first(where: { $0.id == planet.id }) ?? planet
+                        KeyboardShortcutHelper.shared.activeMyPlanet = canonicalPlanet
                         // Update Planet Lite Window Titles
                         // let liteSubtitle = "ipns://\(planet.ipns.shortIPNS())"
                         // navigationSubtitle = liteSubtitle
                     default:
                         KeyboardShortcutHelper.shared.activeMyPlanet = nil
                         // Reset Planet Lite Window Titles
-                        navigationSubtitle = ""
+                        self.navigationSubtitle = ""
                     }
                 }
+                UserDefaults.standard.set(selectedView?.stringValue, forKey: "lastSelectedView")
             }
         }
     }
-    @Published var selectedArticleList: [ArticleModel]? = nil
+
+    private func canonicalSelectedView(_ view: PlanetDetailViewType?) -> PlanetDetailViewType? {
+        switch view {
+        case .myPlanet(let planet):
+            if let canonicalPlanet = myPlanets.first(where: { $0.id == planet.id }) {
+                return .myPlanet(canonicalPlanet)
+            }
+            return nil
+        case .followingPlanet(let planet):
+            if let canonicalPlanet = followingPlanets.first(where: { $0.id == planet.id }) {
+                return .followingPlanet(canonicalPlanet)
+            }
+            return nil
+        case .today:
+            return .today
+        case .unread:
+            return .unread
+        case .starred:
+            return .starred
+        case .none:
+            return nil
+        }
+    }
+    @Published private(set) var selectedArticleListVersion: UInt = 0
+    @Published var selectedArticleList: [ArticleModel]? = nil {
+        didSet {
+            selectedArticleListVersion &+= 1
+        }
+    }
     @Published var selectedArticle: ArticleModel? {
         didSet {
             if selectedArticle != oldValue {
@@ -104,6 +248,7 @@ enum PlanetDetailViewType: Hashable, Equatable {
                         PlanetStore.shared.updateTotalTodayCount()
                     }
                 }
+                UserDefaults.standard.set(selectedArticle?.id.uuidString, forKey: "lastSelectedArticle")
             }
         }
     }
@@ -117,6 +262,8 @@ enum PlanetDetailViewType: Hashable, Equatable {
     @Published var isConfiguringMint = false
     @Published var isConfiguringAggregation = false
     @Published var isShowingMyArticleSettings = false
+    @Published var isShowingRelatedArticles = false
+    @Published var relatedArticleSource: ArticleModel? = nil
 
     @Published var isShowingDeleteMyArticleConfirmation = false
     @Published var deletingMyArticle: MyArticleModel?
@@ -129,7 +276,6 @@ enum PlanetDetailViewType: Hashable, Equatable {
     @Published var followingPlanetLink: String = ""
     @Published var isShowingPlanetInfo = false
     @Published var isShowingPlanetAvatarPicker: Bool = false
-    @Published var isMigrating = false
     @Published var isRebuilding = false
     @Published var rebuildTasks: Int = 0
     @Published var isQuickSharing = false  // use in macOS 12 only.
@@ -164,6 +310,7 @@ enum PlanetDetailViewType: Hashable, Equatable {
     @Published var isShowingSearch: Bool = false
 
     @Published var isShowingIPFSOpen: Bool = false
+    @Published var isShowingIPFSID: Bool = false
 
     @Published var isShowingOnboarding = false
     @Published var isShowingNewOnboarding = false
@@ -204,8 +351,12 @@ enum PlanetDetailViewType: Hashable, Equatable {
         do {
             try load()
         } catch {
-            fatalError("Error when accessing planet repo: \(error)")
+            logger.error("Error when accessing planet repo: \(error.localizedDescription, privacy: .public)")
+            alertTitle = L10n("Failed to Load Planet Library")
+            alertMessage = error.localizedDescription
+            isShowingAlert = true
         }
+        rebuildSearchSnapshots()
 
         if let lastSelectedView = UserDefaults.standard.string(forKey: "lastSelectedView") {
             if lastSelectedView.hasPrefix("myPlanet:") {
@@ -226,6 +377,16 @@ enum PlanetDetailViewType: Hashable, Equatable {
                 selectedView = .starred
             }
         }
+        if let lastSelectedArticleIDString = UserDefaults.standard.string(forKey: "lastSelectedArticle"),
+           let lastSelectedArticleID = UUID(uuidString: lastSelectedArticleIDString) {
+            pendingArticleRestoreID = lastSelectedArticleID
+        }
+        if selectedView != nil {
+            pendingSidebarScroll = true
+        }
+
+        Self.isSharedReady = true
+
     }
 
     func load() throws {
@@ -253,9 +414,164 @@ enum PlanetDetailViewType: Hashable, Equatable {
         followingPlanets = Array(followingAllPlanets[followingPlanetPartition...])
         loadFollowingPlanetsOrder()
         logger.info("Loaded \(self.followingPlanets.count) following planets")
-        updateTotalUnreadCount()
-        updateTotalStarredCount()
-        updateTotalTodayCount()
+        if myDataMonitor == nil {
+            refreshMyDataMonitor()
+        }
+    }
+
+    private enum SelectedViewSnapshot {
+        case none
+        case today
+        case unread
+        case starred
+        case myPlanet(UUID)
+        case followingPlanet(UUID)
+    }
+
+    private struct MyArticleSelectionTarget {
+        let planetID: UUID
+        let articleID: UUID
+    }
+
+    private func refreshMyDataMonitor() {
+        myDataMonitor?.stop()
+        myDataMonitor = MyJSONDirectoryMonitor(directory: MyPlanetModel.myPlanetsPath().path) { [weak self] paths in
+            Task { @MainActor in
+                self?.handleExternalMyJSONPathChanges(paths)
+            }
+        }
+        myDataMonitor?.start()
+    }
+
+    private func handleExternalMyJSONPathChanges(_ changedPaths: [String]) {
+        let jsonPaths = changedPaths.filter { $0.hasSuffix(".json") }
+        guard !jsonPaths.isEmpty else { return }
+        let selectedMyArticle = jsonPaths.compactMap(parseMyArticleSelectionTarget(fromPath:)).first
+        myDataReloadTask?.cancel()
+        myDataReloadTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            logger.info("Detected my data json changes, reloading store")
+            reloadAfterExternalMyDataChange(selectMyArticle: selectedMyArticle)
+        }
+    }
+
+    private func reloadAfterExternalMyDataChange(selectMyArticle target: MyArticleSelectionTarget?) {
+        guard !myDataReloadInProgress else { return }
+        myDataReloadInProgress = true
+        defer { myDataReloadInProgress = false }
+
+        let selectedViewSnapshot = snapshotSelectedView()
+        let selectedArticleID = selectedArticle?.id
+
+        // Only navigate to the changed article when the user is already viewing that planet,
+        // to avoid disrupting reading of an unrelated planet.
+        let isViewingTargetPlanet: Bool
+        if case .myPlanet(let id) = selectedViewSnapshot, let target, target.planetID == id {
+            isViewingTargetPlanet = true
+        } else {
+            isViewingTargetPlanet = false
+        }
+
+        do {
+            try load()
+            if let target,
+                let article = myPlanets.first(where: { $0.id == target.planetID })?.articles.first(where: { $0.id == target.articleID })
+            {
+                Task.detached {
+                    try? article.savePublic()
+                    await MainActor.run {
+                        NotificationCenter.default.post(name: .loadArticle, object: nil)
+                    }
+                }
+            }
+            selectedArticleList = nil
+            ArticleListViewModel.shared.articles = []
+            restoreSelection(from: selectedViewSnapshot)
+            refreshSelectedArticles()
+            if isViewingTargetPlanet, let target,
+                let planet = myPlanets.first(where: { $0.id == target.planetID })
+            {
+                // Force detail-view refresh for the changed article.
+                selectedArticle = nil
+                selectedArticle = planet.articles.first(where: { $0.id == target.articleID })
+            } else {
+                // Force detail-view refresh for the previously-selected article.
+                selectedArticle = nil
+                if let selectedArticleID {
+                    selectedArticle = selectedArticleList?.first(where: { $0.id == selectedArticleID })
+                }
+            }
+        } catch {
+            logger.error("Failed to reload after external my data change: \(error.localizedDescription)")
+        }
+    }
+
+    private func snapshotSelectedView() -> SelectedViewSnapshot {
+        switch selectedView {
+        case .today:
+            return .today
+        case .unread:
+            return .unread
+        case .starred:
+            return .starred
+        case .myPlanet(let planet):
+            return .myPlanet(planet.id)
+        case .followingPlanet(let planet):
+            return .followingPlanet(planet.id)
+        case .none:
+            return .none
+        }
+    }
+
+    private func restoreSelection(from snapshot: SelectedViewSnapshot) {
+        switch snapshot {
+        case .today:
+            selectedView = .today
+        case .unread:
+            selectedView = .unread
+        case .starred:
+            selectedView = .starred
+        case .myPlanet(let id):
+            if let planet = myPlanets.first(where: { $0.id == id }) {
+                selectedView = .myPlanet(planet)
+            } else {
+                selectedView = nil
+            }
+        case .followingPlanet(let id):
+            if let planet = followingPlanets.first(where: { $0.id == id }) {
+                selectedView = .followingPlanet(planet)
+            } else {
+                selectedView = nil
+            }
+        case .none:
+            selectedView = nil
+        }
+    }
+
+    private func parseMyArticleSelectionTarget(fromPath path: String) -> MyArticleSelectionTarget? {
+        let url = URL(fileURLWithPath: path)
+        let components = url.pathComponents
+        guard let myIndex = components.lastIndex(of: "My"),
+            components.count > myIndex + 3
+        else {
+            return nil
+        }
+        let planetIDString = components[myIndex + 1]
+        let articlesComponent = components[myIndex + 2]
+        let articleFilename = components[myIndex + 3]
+        guard articlesComponent == "Articles",
+            articleFilename.lowercased().hasSuffix(".json"),
+            let planetID = UUID(uuidString: planetIDString),
+            let articleID = UUID(uuidString: String(articleFilename.dropLast(5)))
+        else {
+            return nil
+        }
+        return MyArticleSelectionTarget(planetID: planetID, articleID: articleID)
     }
 
     func publishMyPlanets() {
@@ -273,13 +589,28 @@ enum PlanetDetailViewType: Hashable, Equatable {
         }
     }
 
+    func refreshMyPlanetsIPNSKeepAlive() {
+        Task {
+            await withTaskGroup(of: Void.self) { taskGroup in
+                for (i, myPlanet) in myPlanets.enumerated() {
+                    taskGroup.addTask {
+                        try? await myPlanet.publishIPNSKeepAlive()
+                    }
+                    if i >= 2 {
+                        await taskGroup.next()
+                    }
+                }
+            }
+        }
+    }
+
     func updateTotalTodayCount() {
         let b = followingPlanets.reduce(0) { $0 + $1.articles.filter { $0.read == nil && $0.created.timeIntervalSinceNow > -86400 }.count }
         totalTodayCount = b
     }
 
     func updateTotalUnreadCount() {
-        totalUnreadCount = followingPlanets.reduce(0) { $0 + $1.articles.filter { $0.read == nil }.count }
+        totalUnreadCount = followingPlanets.reduce(0) { $0 + $1.unreadCount }
     }
 
     func updateTotalStarredCount() {
@@ -380,8 +711,8 @@ enum PlanetDetailViewType: Hashable, Equatable {
 
     func alert(title: String, message: String? = nil) {
         isShowingAlert = true
-        alertTitle = title
-        alertMessage = message ?? ""
+        alertTitle = L10n(title)
+        alertMessage = message.map { L10n($0) } ?? ""
     }
 
     func removeArticleFromList(article: ArticleModel) {
@@ -390,68 +721,142 @@ enum PlanetDetailViewType: Hashable, Equatable {
                 selectedArticleList?.remove(at: index)
                 ArticleListViewModel.shared.articles.removeAll(where: { $0.id == article.id })
             }
-            switch selectedView {
-            case .today:
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) fetched today"
-                }
-            case .unread:
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) unread"
-                }
-            case .starred:
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) starred"
-                }
-            case .myPlanet(let planet):
-                navigationSubtitle = planet.navigationSubtitle()
-            case .followingPlanet(let planet):
-                navigationSubtitle = planet.navigationSubtitle()
-            case .none:
-                navigationSubtitle = ""
+            updateNavigationSubtitle()
+        }
+    }
+
+    func updateNavigationSubtitle() {
+        switch selectedView {
+        case .today:
+            if let articles = selectedArticleList {
+                navigationSubtitle = L10n("%d fetched today", articles.count)
             }
+        case .unread:
+            if let articles = selectedArticleList {
+                if totalUnreadCount > articles.count {
+                    navigationSubtitle = L10n("%d of %d unread", articles.count, totalUnreadCount)
+                } else {
+                    navigationSubtitle = L10n("%d unread", articles.count)
+                }
+            }
+        case .starred:
+            if let articles = selectedArticleList {
+                navigationSubtitle = L10n("%d starred", articles.count)
+            }
+        case .myPlanet(let planet):
+            let canonicalPlanet = myPlanets.first(where: { $0.id == planet.id }) ?? planet
+            navigationSubtitle = canonicalPlanet.navigationSubtitle()
+        case .followingPlanet(let planet):
+            let canonicalPlanet = followingPlanets.first(where: { $0.id == planet.id }) ?? planet
+            navigationSubtitle = canonicalPlanet.navigationSubtitle()
+        case .none:
+            navigationSubtitle = ""
+        }
+    }
+
+    private func scrollSidebarToSelectedView() {
+        let sidebarID: String?
+        switch selectedView {
+        case .today:
+            sidebarID = "sidebar-today"
+        case .unread:
+            sidebarID = "sidebar-unread"
+        case .starred:
+            sidebarID = "sidebar-starred"
+        case .myPlanet(let planet):
+            sidebarID = "sidebar-my-\(planet.id.uuidString)"
+        case .followingPlanet(let planet):
+            sidebarID = "sidebar-following-\(planet.id.uuidString)"
+        case .none:
+            sidebarID = nil
+        }
+        if let sidebarID {
+            NotificationCenter.default.post(name: .scrollToSidebarItem, object: sidebarID)
         }
     }
 
     func refreshSelectedArticles() {
-        Task { @MainActor in
-            switch selectedView {
-            case .today:
-                selectedArticleList = getTodayArticles()
-                navigationTitle = "Today"
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) fetched today"
-                }
-            case .unread:
-                selectedArticleList = getUnreadArticles()
-                navigationTitle = "Unread"
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) unread"
-                }
-            case .starred:
-                selectedArticleList = getStarredArticles()
-                navigationTitle = "Starred"
-                if let articles = selectedArticleList {
-                    navigationSubtitle = "\(articles.count) starred"
-                }
-            case .myPlanet(let planet):
-                selectedArticleList = planet.articles
-                navigationTitle = planet.name
-                navigationSubtitle = planet.navigationSubtitle()
-            case .followingPlanet(let planet):
-                selectedArticleList = planet.articles
-                navigationTitle = planet.name
-                navigationSubtitle = planet.navigationSubtitle()
-            case .none:
-                selectedArticleList = nil
-                navigationTitle = PlanetStore.app == .lite ? "Croptop" : "Planet"
-                navigationSubtitle = ""
-            }
+        let previousSelectedArticleID = selectedArticle?.id
+        // Clear selection before changing the article list so SwiftUI's List
+        // never has a selection pointing to an item not in its data source.
+        selectedArticle = nil
+
+        switch selectedView {
+        case .today:
+            selectedArticleList = getTodayArticles()
+            navigationTitle = L10n("Today")
             if let articles = selectedArticleList {
-                ArticleListViewModel.shared.articles = articles
-            } else {
-                ArticleListViewModel.shared.articles = []
+                navigationSubtitle = L10n("%d fetched today", articles.count)
             }
+        case .unread:
+            selectedArticleList = getUnreadArticles()
+            navigationTitle = L10n("Unread")
+            if let articles = selectedArticleList {
+                if totalUnreadCount > articles.count {
+                    navigationSubtitle = L10n("%d of %d unread", articles.count, totalUnreadCount)
+                } else {
+                    navigationSubtitle = L10n("%d unread", articles.count)
+                }
+            }
+        case .starred:
+            selectedArticleList = getStarredArticles()
+            navigationTitle = L10n("Starred")
+            if let articles = selectedArticleList {
+                navigationSubtitle = L10n("%d starred", articles.count)
+            }
+        case .myPlanet(let planet):
+            let canonicalPlanet = myPlanets.first(where: { $0.id == planet.id }) ?? planet
+            selectedArticleList = canonicalPlanet.articles
+            navigationTitle = canonicalPlanet.name
+            navigationSubtitle = canonicalPlanet.navigationSubtitle()
+        case .followingPlanet(let planet):
+            let canonicalPlanet = followingPlanets.first(where: { $0.id == planet.id }) ?? planet
+            selectedArticleList = canonicalPlanet.articles
+            navigationTitle = canonicalPlanet.name
+            navigationSubtitle = canonicalPlanet.navigationSubtitle()
+        case .none:
+            selectedArticleList = nil
+            navigationTitle = PlanetStore.app == .lite ? "Croptop" : "Planet"
+            navigationSubtitle = ""
+        }
+
+        // Restore selection if the previously selected article exists in the new list.
+        let restoreID = previousSelectedArticleID ?? pendingArticleRestoreID
+        let isPendingRestore = previousSelectedArticleID == nil && pendingArticleRestoreID != nil
+        pendingArticleRestoreID = nil
+        if let restoreID,
+            let matchingArticle = selectedArticleList?.first(where: { $0.id == restoreID })
+        {
+            selectedArticle = matchingArticle
+            // Scroll the article list to reveal the restored selection.
+            // Use a delay so SwiftUI has time to populate the List.
+            let article = matchingArticle
+            let needsLoadNotification = isPendingRestore
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard self.selectedArticle?.id == article.id else { return }
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
+                if needsLoadNotification {
+                    NotificationCenter.default.post(name: .loadArticle, object: nil)
+                }
+            }
+        } else if isPendingRestore, let restoreID {
+            // Article not in current aggregate view (e.g. read article no longer in Unread).
+            // Fall back to navigating to the article's planet.
+            if let planet = followingPlanets.first(where: { $0.articles.contains(where: { $0.id == restoreID }) }) {
+                pendingArticleRestoreID = restoreID
+                pendingSidebarScroll = true
+                selectedView = .followingPlanet(planet)
+            } else if let planet = myPlanets.first(where: { $0.articles.contains(where: { $0.id == restoreID }) }) {
+                pendingArticleRestoreID = restoreID
+                pendingSidebarScroll = true
+                selectedView = .myPlanet(planet)
+            }
+        }
+
+        if pendingSidebarScroll {
+            pendingSidebarScroll = false
+            scrollSidebarToSelectedView()
         }
     }
 
@@ -467,17 +872,18 @@ enum PlanetDetailViewType: Hashable, Equatable {
         return articles
     }
 
+    private static let unreadDisplayLimit = 500
+
     func getUnreadArticles() -> [ArticleModel] {
-        var articles = followingPlanets.flatMap { followingPlanet in
-            followingPlanet.articles.filter {
-                if ($0.read == nil) {
-                    return true
-                } else {
-                    return false
-                }
-            }
+        var articles: [ArticleModel] = []
+        articles.reserveCapacity(min(totalUnreadCount, Self.unreadDisplayLimit))
+        for followingPlanet in followingPlanets where !followingPlanet.unreadArticles.isEmpty {
+            articles.append(contentsOf: followingPlanet.unreadArticles)
         }
         articles.sort { $0.created > $1.created }
+        if articles.count > Self.unreadDisplayLimit {
+            articles.removeLast(articles.count - Self.unreadDisplayLimit)
+        }
         return articles
     }
 
@@ -493,9 +899,150 @@ enum PlanetDetailViewType: Hashable, Equatable {
         return articles
     }
 
+    private func preferredSelectionViewAfterSaving(
+        _ article: MyArticleModel,
+        preserving preferredView: PlanetDetailViewType?
+    ) -> PlanetDetailViewType {
+        let articlePlanet = article.planet!
+
+        switch preferredView {
+        case .today:
+            if article.created.timeIntervalSinceNow > -86400 {
+                return .today
+            }
+        case .starred:
+            if article.starred != nil {
+                return .starred
+            }
+        case .myPlanet(let planet):
+            let canonicalPlanet = myPlanets.first(where: { $0.id == planet.id }) ?? planet
+            return .myPlanet(canonicalPlanet)
+        default:
+            break
+        }
+
+        let canonicalPlanet = myPlanets.first(where: { $0.id == articlePlanet.id }) ?? articlePlanet
+        return .myPlanet(canonicalPlanet)
+    }
+
+    @MainActor
+    func restoreSavedMyArticleSelection(
+        _ article: MyArticleModel,
+        preserving preferredView: PlanetDetailViewType?
+    ) async {
+        let articlePlanet = article.planet!
+        let targetPlanet = myPlanets.first(where: { $0.id == articlePlanet.id }) ?? articlePlanet
+        let selectionDelay: UInt64 = targetPlanet.templateName == "Croptop" ? 200_000_000 : 0
+
+        func selectArticleFromCurrentList() -> ArticleModel? {
+            selectedArticleList?.first(where: { $0.id == article.id })
+                ?? targetPlanet.articles.first(where: { $0.id == article.id })
+        }
+
+        func applySelection(_ selected: ArticleModel) async {
+            if selectionDelay > 0 {
+                // Croptop needs a delay here when it loads from the local gateway.
+                try? await Task.sleep(nanoseconds: selectionDelay)
+            }
+            if let current = selectedArticle, current === selected {
+                NotificationCenter.default.post(name: .loadArticle, object: nil)
+            } else {
+                selectedArticle = selected
+            }
+            NotificationCenter.default.post(name: .scrollToArticle, object: selected)
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            NotificationCenter.default.post(name: .scrollToArticle, object: selected)
+        }
+
+        let preferredTargetView = preferredSelectionViewAfterSaving(article, preserving: preferredView)
+        let initialView = selectedView
+        selectedView = preferredTargetView
+        if selectedView == initialView {
+            refreshSelectedArticles()
+        }
+
+        let retryDelays: [UInt64] = (preferredTargetView == initialView)
+            ? [0, 80_000_000, 180_000_000, 320_000_000]
+            : [80_000_000, 180_000_000, 320_000_000]
+        for delay in retryDelays {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard selectedView?.stringValue == preferredTargetView.stringValue else {
+                continue
+            }
+            if let selected = selectArticleFromCurrentList() {
+                await applySelection(selected)
+                return
+            }
+        }
+
+        let fallbackView = PlanetDetailViewType.myPlanet(targetPlanet)
+        let currentView = selectedView
+        selectedView = fallbackView
+        if selectedView == currentView {
+            refreshSelectedArticles()
+        }
+
+        let fallbackRetryDelays: [UInt64] = (fallbackView == currentView)
+            ? [0, 80_000_000, 180_000_000, 320_000_000]
+            : [80_000_000, 180_000_000, 320_000_000]
+        for delay in fallbackRetryDelays {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard case .myPlanet(let selectedPlanet) = selectedView,
+                selectedPlanet.id == targetPlanet.id
+            else {
+                continue
+            }
+            if let selected = selectArticleFromCurrentList() {
+                await applySelection(selected)
+                return
+            }
+        }
+
+        await applySelection(targetPlanet.articles.first(where: { $0.id == article.id }) ?? article)
+    }
+
+    private func restoreMovedMyArticleSelection(targetArticleID: UUID, targetPlanetID: UUID) async {
+        // Retry because selectedView refreshes the article list asynchronously.
+        let retryDelays: [UInt64] = [80_000_000, 180_000_000, 320_000_000]
+
+        for delay in retryDelays {
+            try? await Task.sleep(nanoseconds: delay)
+
+            guard case .myPlanet(let selectedPlanet) = selectedView,
+                selectedPlanet.id == targetPlanetID
+            else {
+                continue
+            }
+
+            if let article = selectedArticleList?.first(where: { $0.id == targetArticleID })
+                ?? selectedPlanet.articles.first(where: { $0.id == targetArticleID })
+            {
+                selectedArticle = article
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
+                return
+            }
+        }
+
+        guard let targetPlanet = myPlanets.first(where: { $0.id == targetPlanetID }),
+            let article = targetPlanet.articles.first(where: { $0.id == targetArticleID })
+        else {
+            return
+        }
+
+        selectedArticle = article
+        NotificationCenter.default.post(name: .scrollToArticle, object: article)
+    }
+
     func moveMyArticle(_ article: MyArticleModel, toPlanet: MyPlanetModel) async throws {
         guard let fromPlanet = article.planet else {
             throw PlanetError.InternalError
+        }
+        guard !WriterStore.shared.isEditing(article: article) else {
+            throw PlanetError.MoveEditingPlanetArticleError
         }
         guard fromPlanet.isPublishing == false, toPlanet.isPublishing == false else {
             throw PlanetError.MovePublishingPlanetArticleError
@@ -504,33 +1051,62 @@ enum PlanetDetailViewType: Hashable, Equatable {
         fromPlanet.articles = fromPlanet.articles.filter({ a in
             return a.id != article.id
         })
-        let articleIDString: String = article.id.uuidString.uppercased()
-        let fromPlanetIDString: String = fromPlanet.id.uuidString.uppercased()
-        let toPlanetIDString: String = toPlanet.id.uuidString.uppercased()
+        let articleIDString: String = article.id.uuidString
+        let toPlanetIDString: String = toPlanet.id.uuidString
         let fromArticlePath = article.path
         let targetArticlePath = fromArticlePath.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(toPlanetIDString).appendingPathComponent("Articles").appendingPathComponent("\(articleIDString).json")
         debugPrint("moving article from: \(fromArticlePath), to: \(targetArticlePath) ...")
         try FileManager.default.copyItem(at: fromArticlePath, to: targetArticlePath)
 
         let fromArticlePublicPath = article.publicBasePath
-        let targetArticlePublicPath = fromArticlePublicPath.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(toPlanet.id.uuidString.uppercased()).appendingPathComponent(article.id.uuidString.uppercased())
+        let targetArticlePublicPath = fromArticlePublicPath.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(toPlanet.id.uuidString).appendingPathComponent(article.id.uuidString)
         debugPrint("moving public article from: \(fromArticlePublicPath), to: \(targetArticlePublicPath) ...")
         try FileManager.default.copyItem(at: fromArticlePublicPath, to: targetArticlePublicPath)
 
+        let fromDraftPath = fromPlanet.articleDraftsPath.appendingPathComponent(
+            articleIDString,
+            isDirectory: true
+        )
+        let targetDraftPath = toPlanet.articleDraftsPath.appendingPathComponent(
+            articleIDString,
+            isDirectory: true
+        )
+        let hasArticleDraft = FileManager.default.fileExists(atPath: fromDraftPath.path)
+        if hasArticleDraft {
+            debugPrint("moving article draft from: \(fromDraftPath), to: \(targetDraftPath) ...")
+            try FileManager.default.copyItem(at: fromDraftPath, to: targetDraftPath)
+        }
+
         debugPrint("delete previous article")
         article.delete()
+        if hasArticleDraft {
+            debugPrint("delete previous article draft")
+            try FileManager.default.removeItem(at: fromDraftPath)
+        }
 
         let movedArticle = article
         movedArticle.planet = toPlanet
+        movedArticle.draft = nil
+        movedArticle.articleNumber = toPlanet.allocateArticleNumber()
 
-        movedArticle.path = URL(string: article.path.absoluteString.replacingOccurrences(of: fromPlanetIDString, with: toPlanetIDString))!
-        movedArticle.publicBasePath = URL(string: article.publicBasePath.absoluteString.replacingOccurrences(of: fromPlanetIDString, with: toPlanetIDString))!
-        movedArticle.publicIndexPath = URL(string: article.publicIndexPath.absoluteString.replacingOccurrences(of: fromPlanetIDString, with: toPlanetIDString))!
-        movedArticle.publicInfoPath = URL(string: article.publicInfoPath.absoluteString.replacingOccurrences(of: fromPlanetIDString, with: toPlanetIDString))!
-        movedArticle.publicNFTMetadataPath = URL(string: article.publicNFTMetadataPath.absoluteString.replacingOccurrences(of: fromPlanetIDString, with: toPlanetIDString))!
+        movedArticle.path = targetArticlePath
+        movedArticle.publicBasePath = targetArticlePublicPath
+        movedArticle.publicIndexPath = targetArticlePublicPath.appendingPathComponent(
+            "index.html",
+            isDirectory: false
+        )
+        movedArticle.publicInfoPath = targetArticlePublicPath.appendingPathComponent(
+            "article.json",
+            isDirectory: false
+        )
+        movedArticle.publicNFTMetadataPath = targetArticlePublicPath.appendingPathComponent(
+            "nft.json",
+            isDirectory: false
+        )
 
         toPlanet.articles.append(movedArticle)
         toPlanet.articles = toPlanet.articles.sorted(by: { $0.created > $1.created })
+        try movedArticle.save()
 
         // debugPrint("copy templates assets for target planet")
         // try toPlanet.copyTemplateAssets()
@@ -577,18 +1153,14 @@ enum PlanetDetailViewType: Hashable, Equatable {
 
         debugPrint("refresh UI")
         selectedArticle = nil
-        selectedView = nil
+        selectedView = .myPlanet(refreshedToPlanet)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.selectedView = .myPlanet(refreshedToPlanet)
-            let movedArticleID = movedArticle.id
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                if let myArticle = self?.selectedArticleList?.first(where: { $0.id == movedArticleID }) as? MyArticleModel {
-                    if let refreshed = try? MyArticleModel.load(from: myArticle.path, planet: refreshedToPlanet) {
-                        self?.selectedArticle = refreshed
-                    }
-                }
-            }
+        let movedArticleID = movedArticle.id
+        Task(priority: .userInitiated) { @MainActor [weak self] in
+            await self?.restoreMovedMyArticleSelection(
+                targetArticleID: movedArticleID,
+                targetPlanetID: refreshedToPlanet.id
+            )
         }
 
         debugPrint("publish changes ...")

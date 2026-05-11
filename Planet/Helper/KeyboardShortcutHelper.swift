@@ -16,6 +16,7 @@ class KeyboardShortcutHelper: ObservableObject {
 
     @ObservedObject private var updater: PlanetUpdater
     @ObservedObject private var serviceStore: PlanetPublishedServiceStore
+    @ObservedObject private var ipfsState: IPFSState
 
     @Published var activeWriterWindow: WriterWindow?
     @Published var activeMyPlanet: MyPlanetModel?
@@ -23,6 +24,7 @@ class KeyboardShortcutHelper: ObservableObject {
     init() {
         _updater = ObservedObject(wrappedValue: PlanetUpdater.shared)
         _serviceStore = ObservedObject(wrappedValue: PlanetPublishedServiceStore.shared)
+        _ipfsState = ObservedObject(wrappedValue: IPFSState.shared)
     }
 
     @CommandsBuilder
@@ -161,11 +163,12 @@ class KeyboardShortcutHelper: ObservableObject {
     func toolsCommands() -> some Commands {
         CommandMenu("Tools") {
             Group {
-//                Button {
-//                    PlanetStore.shared.isShowingIPFSOpen = true
-//                } label: {
-//                    Text("Open IPFS Resource")
-//                }
+                Button {
+                    PlanetStore.shared.isShowingIPFSID = true
+                } label: {
+                    Text("Show IPFS ID")
+                }
+                .disabled(!ipfsState.online)
 
                 Button {
                     PlanetAppDelegate.shared.openTemplateWindow()
@@ -190,6 +193,12 @@ class KeyboardShortcutHelper: ObservableObject {
                 publishedFoldersMenus()
 
                 apiConsoleMenus()
+
+                Button {
+                    AppLogWindowManager.shared.open()
+                } label: {
+                    Text("Log")
+                }
 
                 Divider()
             }
@@ -242,7 +251,7 @@ class KeyboardShortcutHelper: ObservableObject {
                         catch {
                             Task { @MainActor in
                                 PlanetStore.shared.isShowingAlert = true
-                                PlanetStore.shared.alertTitle = "Failed to Quick Rebuild Planet"
+                                PlanetStore.shared.alertTitle = L10n("Failed to Quick Rebuild Planet")
                                 PlanetStore.shared.alertMessage = error.localizedDescription
                             }
                         }
@@ -261,7 +270,7 @@ class KeyboardShortcutHelper: ObservableObject {
                         catch {
                             Task { @MainActor in
                                 PlanetStore.shared.isShowingAlert = true
-                                PlanetStore.shared.alertTitle = "Failed to Rebuild Planet"
+                                PlanetStore.shared.alertTitle = L10n("Failed to Rebuild Planet")
                                 PlanetStore.shared.alertMessage = error.localizedDescription
                             }
                         }
@@ -314,8 +323,8 @@ class KeyboardShortcutHelper: ObservableObject {
 
     private func importArticleAction() {
         let panel = NSOpenPanel()
-        panel.message = "Choose Planet Articles to Import"
-        panel.prompt = "Import"
+        panel.message = L10n("Choose Planet Articles to Import")
+        panel.prompt = L10n("Import")
         panel.allowsMultipleSelection = true
         panel.allowedContentTypes = [.package]
         panel.canChooseDirectories = false
@@ -329,11 +338,11 @@ class KeyboardShortcutHelper: ObservableObject {
             }
             catch {
                 PlanetStore.shared.isShowingAlert = true
-                PlanetStore.shared.alertTitle = "Failed to Import Articles"
+                PlanetStore.shared.alertTitle = L10n("Failed to Import Articles")
                 switch error {
                 case PlanetError.ImportPlanetArticlePublishingError:
                     PlanetStore.shared.alertMessage =
-                        "Planet is publishing progress, please try again later."
+                        L10n("Planet is publishing progress, please try again later.")
                 default:
                     PlanetStore.shared.alertMessage = error.localizedDescription
                 }
@@ -345,12 +354,12 @@ class KeyboardShortcutHelper: ObservableObject {
         let isCroptopSiteData: Bool = PlanetStore.app == .lite
         let panel = NSOpenPanel()
         if isCroptopSiteData {
-            panel.message = "Choose Croptop Site to Import"
+            panel.message = L10n("Choose Croptop Site to Import")
         }
         else {
-            panel.message = "Choose Planet Data to Import"
+            panel.message = L10n("Choose Planet Data to Import")
         }
-        panel.prompt = "Import"
+        panel.prompt = L10n("Import")
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.package]
         panel.canChooseDirectories = false
@@ -390,7 +399,7 @@ class KeyboardShortcutHelper: ObservableObject {
                             if let published = folder.published,
                                 let publishedLink = folder.publishedLink
                             {
-                                Text("Last Published: " + published.relativeDateDescription())
+                                Text(L10n("Last Published: ") + published.relativeDateDescription())
                                 Divider()
                                 Button {
                                     if let url = URL(

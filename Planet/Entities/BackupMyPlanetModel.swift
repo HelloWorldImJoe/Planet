@@ -13,6 +13,8 @@ struct BackupMyPlanetModel: Codable {
     let about: String
     let domain: String?
     let authorName: String?
+    let slug: String?
+    let nextArticleNumber: Int?
     let ipns: String
     let created: Date
     let updated: Date
@@ -53,9 +55,6 @@ struct BackupMyPlanetModel: Codable {
     let juiceboxEnabled: Bool?
     let juiceboxProjectID: Int?
     let juiceboxProjectIDGoerli: Int?
-    let farcasterEnabled: Bool?
-    let farcasterUsername: String?
-    let farcasterJSON: String?
     let acceptsDonation: Bool?
     let acceptsDonationMessage: String?
     let acceptsDonationETHAddress: String?
@@ -66,4 +65,15 @@ struct BackupMyPlanetModel: Codable {
     let saveRoundAvatar: Bool?
     let doNotIndex: Bool?
     let prewarmNewPost: Bool?
+    let publishAsIPNS: Bool?
+    let sshRsyncEnabled: Bool?
+    let sshRsyncDestination: String?
+    let sshRsyncKeyPath: String?
+    let sshRsyncDeleteEnabled: Bool?
+    let cloudflarePagesEnabled: Bool?
+    let cloudflarePagesAccountID: String?
+    let cloudflarePagesAPIToken: String?
+    let cloudflarePagesProjectName: String?
+    let cloudflarePagesLastDeployedProjectName: String?
+    let cloudflarePagesLastDeployedURL: String?
 }

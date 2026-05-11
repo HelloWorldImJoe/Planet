@@ -44,6 +44,7 @@ enum AttachmentType: String, Codable {
 class Attachment: Codable, Equatable, Hashable, ObservableObject {
     let name: String
     @Published var type: AttachmentType
+    @Published var videoCompressionPreset: String?
     let created: Date
 
     @Published var thumbnail: NSImage? = nil
@@ -54,25 +55,8 @@ class Attachment: Codable, Equatable, Hashable, ObservableObject {
     var markdown: String? {
         switch type {
         case .image:
-            if let im = NSImage(contentsOf: self.path) {
-                let imageRep = im.representations.first as? NSBitmapImageRep
-                let width = imageRep?.pixelsWide ?? 0
-                let _ = imageRep?.pixelsHigh ?? 0
-                let pointSize = im.size
-                let pointWidth = pointSize.width
-                let _ = pointSize.height
-                var widthToUse = 0
-                if (CGFloat(width) / pointWidth) > 1 {
-                    widthToUse = Int(pointWidth)
-                } else {
-                    widthToUse = width
-                }
-                if Int(widthToUse) > 0 {
-                    return "<img width=\"\(Int(widthToUse))\" alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
-                } else {
-                    return "<img alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
-                }
-
+            if let width = path.imagePixelWidth, width > 0 {
+                return "<img width=\"\(width)\" alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
             }
             return "<img alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
         case .file:
@@ -119,6 +103,7 @@ class Attachment: Codable, Equatable, Hashable, ObservableObject {
     func hash(into hasher: inout Hasher) {
         hasher.combine(name)
         hasher.combine(type)
+        hasher.combine(videoCompressionPreset)
         hasher.combine(draft)
         hasher.combine(created)
     }
@@ -133,12 +118,14 @@ class Attachment: Codable, Equatable, Hashable, ObservableObject {
         return lhs.name == rhs.name
             && lhs.draft == rhs.draft
             && lhs.type == rhs.type
+            && lhs.videoCompressionPreset == rhs.videoCompressionPreset
             && lhs.created == rhs.created
     }
 
     enum CodingKeys: String, CodingKey {
         case name
         case type
+        case videoCompressionPreset
         case created
     }
 
@@ -146,6 +133,7 @@ class Attachment: Codable, Equatable, Hashable, ObservableObject {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
         type = try container.decode(AttachmentType.self, forKey: .type)
+        videoCompressionPreset = try container.decodeIfPresent(String.self, forKey: .videoCompressionPreset)
         created = try container.decode(Date.self, forKey: .created)
     }
 
@@ -153,12 +141,14 @@ class Attachment: Codable, Equatable, Hashable, ObservableObject {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(name, forKey: .name)
         try container.encode(type, forKey: .type)
+        try container.encodeIfPresent(videoCompressionPreset, forKey: .videoCompressionPreset)
         try container.encode(created, forKey: .created)
     }
 
     init(name: String, type: AttachmentType) {
         self.name = name
         self.type = type
+        videoCompressionPreset = nil
         created = Date()
     }
 

@@ -3,10 +3,20 @@ import SwiftyJSON
 import UserNotifications
 import os
 
+struct IPFSDaemonHealthStatus: Sendable {
+    let processRunning: Bool
+    let gatewayReachable: Bool
+
+    var isOnline: Bool {
+        processRunning && gatewayReachable
+    }
+}
+
 actor IPFSDaemon {
     static let shared = IPFSDaemon()
 
     private var settingUp: Bool = false
+    private var daemonProcess: Process?
     private var swarmPort: UInt16!
     private var apiPort: UInt16!
     private var gatewayPort: UInt16!
@@ -26,10 +36,19 @@ actor IPFSDaemon {
 
         Self.logger.info("Setting up IPFS")
 
-        let repoContents = try! FileManager.default.contentsOfDirectory(
-            at: IPFSCommand.IPFSRepositoryPath,
-            includingPropertiesForKeys: nil
-        )
+        let repoContents: [URL]
+        do {
+            repoContents = try FileManager.default.contentsOfDirectory(
+                at: IPFSCommand.IPFSRepositoryPath,
+                includingPropertiesForKeys: nil
+            )
+        } catch {
+            Self.logger.error("Failed to read IPFS repo directory: \(error)")
+            await MainActor.run {
+                IPFSState.shared.reasonIPFSNotRunning = L10n("Failed to access IPFS repository at %@.\n\nError: %@", IPFSCommand.IPFSRepositoryPath.path, error.localizedDescription)
+            }
+            return
+        }
         if repoContents.isEmpty {
             Self.logger.info("Initializing IPFS config")
             if let result = try? IPFSCommand.IPFSInit().run(),
@@ -287,8 +306,30 @@ actor IPFSDaemon {
         }
     }
 
+    func healthStatus(apiPort: UInt16, gatewayPort: UInt16) -> IPFSDaemonHealthStatus {
+        if let daemonProcess, !daemonProcess.isRunning {
+            self.daemonProcess = nil
+        }
+
+        let hasTrackedProcess = daemonProcess?.isRunning == true
+        let hasDaemonControlPort = Self.hasDaemonControlPort(apiPort: apiPort)
+        let gatewayReachable = Self.isLoopbackPortReachable(port: gatewayPort)
+
+        return IPFSDaemonHealthStatus(
+            processRunning: hasTrackedProcess || hasDaemonControlPort,
+            gatewayReachable: gatewayReachable
+        )
+    }
+
     func launch() throws {
         Self.logger.info("Launching daemon")
+        if let daemonProcess, daemonProcess.isRunning {
+            Self.logger.info("Daemon is already running")
+            Task.detached(priority: .utility) {
+                await IPFSState.shared.updateStatus()
+            }
+            return
+        }
         if swarmPort == nil || apiPort == nil || gatewayPort == nil {
             Self.logger.info("IPFS is not ready, abort launching process, trying to setup again.")
             Task.detached(priority: .utility) {
@@ -301,18 +342,21 @@ actor IPFSDaemon {
             Task { @MainActor in
                 IPFSState.shared.updateOperatingStatus(true)
             }
-            try IPFSCommand.launchDaemon().run(
+            var didHandleReadySignal = false
+            let launchedProcess = try IPFSCommand.launchDaemon().run(
                 outHandler: { data in
                     let log = data.logFormat()
                     Self.logger.debug("[IPFS stdout]\n\(log, privacy: .public)")
-                    if log.contains("Daemon is ready") {
+                    IPFSLogger.log("[daemon stdout] \(log)")
+                    if !didHandleReadySignal, log.contains("Daemon is ready") {
+                        didHandleReadySignal = true
                         Self.logger.info("Daemon launched")
                         Task.detached(priority: .utility) {
                             try? await Task.sleep(nanoseconds: 500_000_000)
                             IPFSState.shared.updateAppSettings()
                             try? await IPFSState.shared.calculateRepoSize()
-                            Task { @MainActor in
-                                IPFSState.shared.updateOnlineStatus(true)
+                            await IPFSState.shared.updateStatus()
+                            await MainActor.run {
                                 IPFSState.shared.updateOperatingStatus(false)
                             }
                         }
@@ -321,12 +365,15 @@ actor IPFSDaemon {
                 errHandler: { data in
                     let log = data.logFormat()
                     Self.logger.debug("[IPFS error]\n\(log, privacy: .public)")
-                    Task { @MainActor in
-                        IPFSState.shared.updateOnlineStatus(false)
-                        IPFSState.shared.updateOperatingStatus(false)
+                    IPFSLogger.log("[ERROR] [daemon stderr] \(log)")
+                },
+                completionHandler: { ret in
+                    Task.detached(priority: .utility) {
+                        await self.handleDaemonTermination(terminationStatus: ret)
                     }
                 }
             )
+            self.daemonProcess = launchedProcess
         }
         catch {
             Self.logger.error(
@@ -378,6 +425,18 @@ actor IPFSDaemon {
             )
         }
         Task { @MainActor in
+            IPFSState.shared.updateOperatingStatus(false)
+        }
+    }
+
+    private func handleDaemonTermination(terminationStatus: Int) async {
+        if daemonProcess?.isRunning != true {
+            daemonProcess = nil
+        }
+
+        Self.logger.info("Daemon process terminated with status \(terminationStatus)")
+        await MainActor.run {
+            IPFSState.shared.updateOnlineStatus(false)
             IPFSState.shared.updateOperatingStatus(false)
         }
     }
@@ -617,6 +676,35 @@ actor IPFSDaemon {
         throw PlanetError.IPFSAPIError
     }
 
+    func getID() async throws -> IPFSID {
+        Self.logger.info("Getting IPFS node ID")
+        do {
+            let result = try await api(path: "id")
+            do {
+                return try JSONDecoder.shared.decode(IPFSID.self, from: result)
+            }
+            catch {
+                Self.logger.error(
+                    """
+                    Failed to decode IPFS node ID: got error from API call, \
+                    result: \(result.logFormat()) \
+                    error: \(String(describing: error))
+                    """
+                )
+                throw PlanetError.IPFSAPIError
+            }
+        }
+        catch {
+            Self.logger.error(
+                """
+                Failed to get IPFS node ID: error when accessing IPFS API, \
+                cause: \(String(describing: error))
+                """
+            )
+        }
+        throw PlanetError.IPFSAPIError
+    }
+
     func resolveIPNSorDNSLink(name: String) async throws -> String {
         Self.logger.info("Resolving IPNS or DNSLink \(name)")
         do {
@@ -815,8 +903,8 @@ actor IPFSDaemon {
         if count > 0 {
             // Create and schedule notification
             let content = UNMutableNotificationContent()
-            content.title = "IPFS Garbage Collection Complete"
-            content.body = "Removed \(count) unused objects"
+            content.title = L10n("IPFS Garbage Collection Complete")
+            content.body = L10n("Removed %d unused objects", count)
             content.sound = .default
             content.interruptionLevel = .timeSensitive
 
@@ -842,7 +930,10 @@ actor IPFSDaemon {
         let gateway = IPFSState.shared.getGateway()
         let url = URL(string: "\(gateway)/ipns/\(ipns)\(path)")!
         let (data, response) = try await URLSession.shared.data(for: URLRequest(url: url))
-        let httpResponse = response as! HTTPURLResponse
+        guard let httpResponse = response as? HTTPURLResponse else {
+            Self.logger.error("Failed to get file from IPFS \(ipns)\(path): non-HTTP response")
+            throw PlanetError.IPFSAPIError
+        }
         if !httpResponse.ok {
             Self.logger.error(
                 """
@@ -881,8 +972,10 @@ actor IPFSDaemon {
         else {
             if let errorDetails = String(data: data, encoding: .utf8) {
                 Self.logger.error("Failed to access IPFS API \(path): \(errorDetails)")
+                IPFSLogger.log("[ERROR] API \(path) failed: \(errorDetails)")
             }
             Self.logger.error("IPFS API Error: \(response)")
+            IPFSLogger.log("[ERROR] API \(path) failed: \(response)")
             throw PlanetError.IPFSAPIError
         }
         // debugPrint the response
@@ -917,15 +1010,6 @@ extension IPFSDaemon {
             ],
         ],  // Pinnable
         [
-            "ID": "12D3KooWDaGQ3Fu3iLgFxrrg5Vfef9z5L3DQZoyqFxQJbKKPnCc8",
-            "Addrs": [
-                "/ip4/143.198.18.166/tcp/4001",
-                "/ip6/2604:a880:800:10::735:7001/tcp/4001",
-                "/ip4/143.198.18.166/udp/4001/quic",
-                "/ip6/2604:a880:800:10::735:7001/udp/4001/quic",
-            ],
-        ],  // eth.sucks
-        [
             "ID": "12D3KooWJ6MTkNM8Bu8DzNiRm1GY3Wqh8U8Pp1zRWap6xY3MvsNw",
             "Addrs": [
                 "/dnsaddr/node-1.ipfs.bit.site"
@@ -953,11 +1037,44 @@ extension IPFSDaemon {
     ])
 
     static func urlForCID(_ cid: String) -> URL? {
-        return URL(string: "https://\(cid).eth.sucks/")
+        // CIDv0 (Qm…) doesn't work with subdomain-style gateways; always use dweb.link path style
+        if cid.hasPrefix("Qm") {
+            return URL(string: "https://dweb.link/ipfs/\(cid)/")
+        }
+        switch IPFSGateway.selectedGateway() {
+        case .limo:
+            // eth.limo does not support CID or IPNS subdomain resolution; fall back to eth.sucks
+            return URL(string: "https://\(cid).eth.sucks/")
+        case .sucks:
+            return URL(string: "https://\(cid).eth.sucks/")
+        case .croptop:
+            return URL(string: "https://\(cid).crop.top/")
+        case .dweblink:
+            return URL(string: "https://dweb.link/ipfs/\(cid)/")
+        }
     }
 
+    // No CIDv0 special case needed here — IPNS names are always key-based, never CIDv0
     static func urlForIPNS(_ ipns: String) -> URL? {
-        return URL(string: "https://\(ipns).eth.sucks/")
+        switch IPFSGateway.selectedGateway() {
+        case .limo:
+            // eth.limo does not support CID or IPNS subdomain resolution; fall back to eth.sucks
+            return URL(string: "https://\(ipns).eth.sucks/")
+        case .sucks:
+            return URL(string: "https://\(ipns).eth.sucks/")
+        case .croptop:
+            return URL(string: "https://\(ipns).crop.top/")
+        case .dweblink:
+            return URL(string: "https://\(ipns).ipns.dweb.link/")
+        }
+    }
+
+    private static func hasDaemonControlPort(apiPort: UInt16) -> Bool {
+        let apiFile = IPFSCommand.IPFSRepositoryPath.appendingPathComponent("api", isDirectory: false)
+        guard FileManager.default.fileExists(atPath: apiFile.path) else {
+            return false
+        }
+        return isLoopbackPortReachable(port: apiPort)
     }
 
     // Reference: https://stackoverflow.com/a/65162953
@@ -983,6 +1100,31 @@ extension IPFSDaemon {
         let isOpen = listen(socketFileDescriptor, SOMAXCONN) != -1
         Darwin.close(socketFileDescriptor)
         return isOpen
+    }
+
+    static func isLoopbackPortReachable(port: in_port_t) -> Bool {
+        let socketFileDescriptor = socket(AF_INET, SOCK_STREAM, 0)
+        if socketFileDescriptor == -1 {
+            return false
+        }
+        defer {
+            Darwin.close(socketFileDescriptor)
+        }
+
+        var addr = sockaddr_in()
+        let sizeOfSocketAddr = MemoryLayout<sockaddr_in>.size
+        addr.sin_len = __uint8_t(sizeOfSocketAddr)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = Int(OSHostByteOrder()) == OSLittleEndian ? _OSSwapInt16(port) : port
+        addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        addr.sin_zero = (0, 0, 0, 0, 0, 0, 0, 0)
+
+        return withUnsafePointer(to: &addr) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                Darwin.connect(socketFileDescriptor, sockaddrPointer, socklen_t(sizeOfSocketAddr))
+                    == 0
+            }
+        }
     }
 
     static func scoutPort(_ range: ClosedRange<UInt16>) -> UInt16? {

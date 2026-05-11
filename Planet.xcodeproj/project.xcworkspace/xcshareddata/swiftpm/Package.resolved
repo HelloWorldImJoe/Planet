@@ -1,5 +1,5 @@
 {
-  "originHash" : "e9e04a39726bcfcc3942e59803a0f2832c4462fe86077a5192351be1b7e06890",
+  "originHash" : "90defa762c09dd8a876ec47c62f93bfcd1e00542a06c65f808ff023f830dc328",
   "pins" : [
     {
       "identity" : "async-http-client",
@@ -74,6 +74,15 @@
       }
     },
     {
+      "identity" : "grdb.swift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/groue/GRDB.swift",
+      "state" : {
+        "revision" : "36e30a6f1ef10e4194f6af0cff90888526f0c115",
+        "version" : "7.10.0"
+      }
+    },
+    {
       "identity" : "libcmark_gfm",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/KristopherGBaker/libcmark_gfm",
@@ -115,7 +124,7 @@
       "location" : "https://github.com/Planetable/PlanetSiteTemplates.git",
       "state" : {
         "branch" : "main",
-        "revision" : "90b50be2850b4884f155879b6aff7fc3c5468b1b"
+        "revision" : "2b2e806b4ecf6e70a1ebd76383532f9a058392a9"
       }
     },
     {
@@ -159,8 +168,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/sparkle-project/Sparkle",
       "state" : {
-        "revision" : "0ca3004e98712ea2b39dd881d28448630cce1c99",
-        "version" : "2.7.0"
+        "revision" : "21d8df80440b1ca3b65fa82e40782f1e5a9e6ba2",
+        "version" : "2.9.0"
       }
     },
     {

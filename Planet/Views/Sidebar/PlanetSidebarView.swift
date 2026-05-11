@@ -7,9 +7,15 @@
 
 import SwiftUI
 
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
+
 struct PlanetSidebarView: View {
     @EnvironmentObject var planetStore: PlanetStore
     @StateObject var ipfsState = IPFSState.shared
+    @AppStorage(String.settingsAIIsReady) private var settingsAIIsReady: Bool = false
+    @State private var isOnDeviceAIAvailable: Bool = false
 
     let timer1m = Timer.publish(every: 60, on: .current, in: .common).autoconnect()
     let timer3m = Timer.publish(every: 180, on: .current, in: .common).autoconnect()
@@ -22,75 +28,89 @@ struct PlanetSidebarView: View {
                 Divider()
             }
 
-            List(selection: $planetStore.selectedView) {
-                Section(header: Text("Smart Feeds")) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "sun.max.fill")
-                            .resizable()
-                            .foregroundColor(Color.orange)
-                            .frame(width: 18, height: 18)
-                            .padding(.all, 2)
-                        Text("Today")
-                            .font(.body)
-                            .foregroundColor(.primary)
-                    }
-                    .badge(planetStore.totalTodayCount)
-                    .tag(PlanetDetailViewType.today)
+            ScrollViewReader { sidebarProxy in
+                List(selection: $planetStore.selectedView) {
+                    Section(header: Text("Smart Feeds")) {
+                        HStack(spacing: 4) {
+                            smartFeedIcon {
+                                Image(systemName: "sun.max.fill")
+                                    .resizable()
+                                    .foregroundColor(Color.orange)
+                            }
+                            Text("Today")
+                                .font(.body)
+                                .foregroundColor(.primary)
+                        }
+                        .badge(planetStore.totalTodayCount)
+                        .tag(PlanetDetailViewType.today)
+                        .id("sidebar-today")
 
-                    HStack(spacing: 4) {
-                        Image(systemName: "circle.inset.filled")
-                            .resizable()
-                            .foregroundColor(Color.blue)
-                            .frame(width: 18, height: 18)
-                            .padding(.all, 2)
-                        Text("Unread")
-                            .font(.body)
-                            .foregroundColor(.primary)
-                    }
-                    .badge(planetStore.totalUnreadCount)
-                    .tag(PlanetDetailViewType.unread)
+                        HStack(spacing: 4) {
+                            smartFeedIcon {
+                                Image(systemName: "circle.inset.filled")
+                                    .resizable()
+                                    .foregroundColor(Color.blue)
+                            }
+                            Text("Unread")
+                                .font(.body)
+                                .foregroundColor(.primary)
+                        }
+                        .badge(planetStore.totalUnreadCount)
+                        .tag(PlanetDetailViewType.unread)
+                        .id("sidebar-unread")
 
-                    HStack(spacing: 4) {
-                        Image(systemName: "star.fill")
-                            .resizable()
-                            .renderingMode(.original)
-                            .frame(width: 18, height: 18)
-                            .padding(.all, 2)
-                        Text("Starred")
-                            .font(.body)
-                            .foregroundColor(.primary)
+                        HStack(spacing: 4) {
+                            smartFeedIcon {
+                                Image(systemName: "star.fill")
+                                    .resizable()
+                                    .renderingMode(.original)
+                            }
+                            Text("Starred")
+                                .font(.body)
+                                .foregroundColor(.primary)
+                        }
+                        .badge(planetStore.totalStarredCount)
+                        .tag(PlanetDetailViewType.starred)
+                        .id("sidebar-starred")
                     }
-                    .badge(planetStore.totalStarredCount)
-                    .tag(PlanetDetailViewType.starred)
-                }
 
-                Section(header: Text("My Planets")) {
-                    ForEach(planetStore.myPlanets) { planet in
-                        HStack {
-                            MyPlanetSidebarItem(planet: planet)
-                        }.tag(PlanetDetailViewType.myPlanet(planet))
+                    Section(header: Text("My Planets")) {
+                        ForEach(planetStore.myPlanets) { planet in
+                            HStack {
+                                MyPlanetSidebarItem(planet: planet)
+                            }
+                            .tag(PlanetDetailViewType.myPlanet(planet))
+                            .id("sidebar-my-\(planet.id.uuidString)")
+                        }
+                        .onMove { (indexes, dest) in
+                            withAnimation {
+                                planetStore.moveMyPlanets(fromOffsets: indexes, toOffset: dest)
+                            }
+                        }
                     }
-                    .onMove { (indexes, dest) in
-                        withAnimation {
-                            planetStore.moveMyPlanets(fromOffsets: indexes, toOffset: dest)
+
+                    Section(header: Text("Following Planets")) {
+                        ForEach(planetStore.followingPlanets) { planet in
+                            HStack {
+                                FollowingPlanetSidebarItem(planet: planet)
+                            }
+                            .tag(PlanetDetailViewType.followingPlanet(planet))
+                            .id("sidebar-following-\(planet.id.uuidString)")
+                        }
+                        .onMove { (indexes, dest) in
+                            withAnimation {
+                                planetStore.moveFollowingPlanets(fromOffsets: indexes, toOffset: dest)
+                            }
                         }
                     }
                 }
-
-                Section(header: Text("Following Planets")) {
-                    ForEach(planetStore.followingPlanets) { planet in
-                        HStack {
-                            FollowingPlanetSidebarItem(planet: planet)
-                        }.tag(PlanetDetailViewType.followingPlanet(planet))
-                    }
-                    .onMove { (indexes, dest) in
-                        withAnimation {
-                            planetStore.moveFollowingPlanets(fromOffsets: indexes, toOffset: dest)
-                        }
+                .listStyle(.sidebar)
+                .onReceive(NotificationCenter.default.publisher(for: .scrollToSidebarItem)) { n in
+                    if let id = n.object as? String {
+                        sidebarProxy.scrollTo(id, anchor: .center)
                     }
                 }
             }
-            .listStyle(.sidebar)
 
             Divider()
 
@@ -104,7 +124,7 @@ struct PlanetSidebarView: View {
                     Circle()
                         .frame(width: 11, height: 11, alignment: .center)
                         .foregroundColor(ipfsState.online ? Color.green : Color.red)
-                    Text(ipfsState.online ? "Online" : "Offline")
+                    Text(ipfsState.online ? "IPFS Online" : "IPFS Offline")
                         .font(.body)
 
                     Spacer()
@@ -163,11 +183,19 @@ struct PlanetSidebarView: View {
         .sheet(isPresented: $planetStore.isCreatingPlanet) {
             CreatePlanetView()
         }
+        .task {
+            await ipfsState.updateStatus()
+            checkOnDeviceAIAvailability()
+        }
         .frame(minWidth: 220, idealWidth: UserDefaults.standard.double(forKey: "sidebarWidth") > 0 ? UserDefaults.standard.double(forKey: "sidebarWidth") : 220) // See https://github.com/Planetable/Planet/issues/393
         .toolbar {
             Button(action: toggleSidebar) {
                 Image(systemName: "sidebar.left")
                     .help("Toggle Sidebar")
+            }
+
+            if settingsAIIsReady || isOnDeviceAIAvailable {
+                PlanetAIChatToolbarButton()
             }
 
             if #available(macOS 14.0, *) {
@@ -227,8 +255,39 @@ struct PlanetSidebarView: View {
         }
     }
 
+    private struct PlanetAIChatToolbarButton: View {
+        var body: some View {
+            Button {
+                PlanetAppDelegate.shared.openPlanetAIChatWindow()
+            } label: {
+                Image(systemName: "sparkles")
+            }
+            .help("Planet AI Chat")
+        }
+    }
+
     private func toggleSidebar() {
         NSApp.keyWindow?.firstResponder?
             .tryToPerform(#selector(NSSplitViewController.toggleSidebar(_:)), with: nil)
+    }
+
+    private func checkOnDeviceAIAvailability() {
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            let model = SystemLanguageModel.default
+            if case .available = model.availability {
+                isOnDeviceAIAvailable = true
+                return
+            }
+        }
+        #endif
+        isOnDeviceAIAvailable = false
+    }
+
+    private func smartFeedIcon<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        content()
+            .frame(width: 18, height: 18)
+            .padding(.all, 2)
+            .shadow(color: Color.black.opacity(0.1), radius: 1, x: 0, y: 1)
     }
 }

@@ -2,11 +2,12 @@ import SwiftUI
 
 struct MyArticleItemView: View {
     @ObservedObject var article: MyArticleModel
+    var isSelected: Bool
 
     var body: some View {
         HStack {
             VStack {
-                article.starView()
+                article.starView(isSelected: isSelected)
                     .visibility(article.starred != nil ? .visible : .invisible)
                 Spacer()
             }
@@ -16,7 +17,7 @@ struct MyArticleItemView: View {
                         if article.pinned != nil {
                             Image(systemName: "pin.fill")
                                 .font(.caption)
-                                .foregroundColor(.accentColor)
+                                .foregroundColor(isSelected ? .white : .accentColor)
                                 .padding(.trailing, 4)
                         }
                         Text(article.title)
@@ -48,7 +49,7 @@ struct MyArticleItemView: View {
                         Spacer()
                     }
                 }
-                .frame(height: 60)
+                .frame(height: 60, alignment: .topLeading)
                 HStack(spacing: 6) {
                     article.mediaLabels(includeSpacers: false)
                     if article.articleType == .page {
@@ -63,7 +64,7 @@ struct MyArticleItemView: View {
                             )
                     }
                     if let included = article.isIncludedInNavigation, included {
-                        Text("Navigation \(article.navigationWeight ?? 1)")
+                        Text(L10n("Navigation %d", article.navigationWeight ?? 1))
                             .lineLimit(1)
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -110,18 +111,24 @@ struct MyArticleItemView: View {
                         Image(systemName: "gear")
                         Text("Settings")
                     }
-
+                    Button {
+                        PlanetStore.shared.relatedArticleSource = article
+                        PlanetStore.shared.isShowingRelatedArticles = true
+                    } label: {
+                        Image(systemName: "doc.text.magnifyingglass")
+                        Text("Find Related Articles")
+                    }
                     Divider()
                 }
                 else {
                     if let siteName = article.originalSiteName {
                         Section {
-                            Text("Aggregated from " + siteName)
+                            Text(L10n("Aggregated from ") + siteName)
                         }
                     }
                 }
 
-                Menu("Star") {
+                Menu("Add Star") {
                     ArticleSetStarView(article: article)
                 }
                 if article.starred != nil {
@@ -147,7 +154,7 @@ struct MyArticleItemView: View {
                         } catch {
                             Task { @MainActor in
                                 PlanetStore.shared.isShowingAlert = true
-                                PlanetStore.shared.alertTitle = "Failed to Export Article"
+                                PlanetStore.shared.alertTitle = L10n("Failed to Export Article")
                                 PlanetStore.shared.alertMessage = error.localizedDescription
                             }
                         }
@@ -160,7 +167,7 @@ struct MyArticleItemView: View {
                         } catch {
                             Task { @MainActor in
                                 PlanetStore.shared.isShowingAlert = true
-                                PlanetStore.shared.alertTitle = "Failed to Share Article"
+                                PlanetStore.shared.alertTitle = L10n("Failed to Share Article")
                                 PlanetStore.shared.alertMessage = error.localizedDescription
                             }
                         }
@@ -207,6 +214,21 @@ struct MyArticleItemView: View {
                 }
 
                 Divider()
+
+                if let articleReference = article.articleReference {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(articleReference, forType: .string)
+                    } label: {
+                        Text("Copy Ref: \(articleReference)")
+                    }
+                }
+
+                Button {
+                    copyMarkdown()
+                } label: {
+                    Text("Copy Markdown")
+                }
 
                 Button {
                     if let url = article.browserURL {
@@ -274,11 +296,14 @@ struct MyArticleItemView: View {
                         catch {
                             debugPrint("failed to move article: \(error)")
                             PlanetStore.shared.isShowingAlert = true
-                            PlanetStore.shared.alertTitle = "Failed to Move Article"
+                            PlanetStore.shared.alertTitle = L10n("Failed to Move Article")
                             switch error {
                             case PlanetError.MovePublishingPlanetArticleError:
                                 PlanetStore.shared.alertMessage =
                                     "Please wait for the planet publishing completed then try again."
+                            case PlanetError.MoveEditingPlanetArticleError:
+                                PlanetStore.shared.alertMessage =
+                                    "Close the Writer window for this article before moving it."
                             default:
                                 PlanetStore.shared.alertMessage = error.localizedDescription
                             }
@@ -361,6 +386,13 @@ struct MyArticleItemView: View {
             return img
         }
         return nil
+    }
+
+    private func copyMarkdown() {
+        let markdown = "\(article.title)\n\n\(article.content)"
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(markdown, forType: .string)
     }
 
     private func updateArticlePinStatus(_ flag: Bool) async throws {

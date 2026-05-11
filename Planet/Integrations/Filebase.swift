@@ -72,7 +72,7 @@ struct Filebase: Codable {
             debugPrint("Filebase: failed to send POST request")
             return nil
         }
-        if !(response2 as! HTTPURLResponse).ok {
+        guard let httpResponse = response2 as? HTTPURLResponse, httpResponse.ok else {
             debugPrint("Filebase: http response is non-200 \(response2)")
             return nil
         }
@@ -109,7 +109,7 @@ struct Filebase: Codable {
                 debugPrint("Filebase: check pin status error - \(errorReason)")
                 var message: String?
                 if errorReason == "ERR_INVALID_TOKEN" {
-                    message = "Please check API token"
+                    message = L10n("Please check API token")
                 }
                 return (nil, message)
             }

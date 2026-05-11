@@ -39,19 +39,10 @@ class WriterWindow: NSWindow {
 
     @objc func send(_ sender: Any?) {
         do {
-            try draft.saveToArticle()
+            let article = try draft.saveToArticle()
             Task { @MainActor in
                 WriterStore.shared.closeWriterWindow(byDraftID: self.draft.id)
-                if let target = self.draft.target {
-                    switch target {
-                    case .myPlanet(let wrapper):
-                        let article = wrapper.value
-                        NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                    case .article(let wrapper):
-                        let article = wrapper.value
-                        NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                    }
-                }
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
             }
         } catch {
             PlanetStore.shared.alert(title: "Failed to send article: \(error)")
@@ -95,7 +86,7 @@ extension WriterWindow: NSToolbarDelegate {
             return makeToolbarButton(
                 itemIdentifier: .send,
                 title: title,
-                image: NSImage(systemSymbolName: "paperplane", accessibilityDescription: "Send")!,
+                image: NSImage(systemSymbolName: "paperplane", accessibilityDescription: L10n("Send"))!,
                 selector: "send:"
             )
         case .insertEmoji:
@@ -103,7 +94,7 @@ extension WriterWindow: NSToolbarDelegate {
             return makeToolbarButton(
                 itemIdentifier: .insertEmoji,
                 title: title,
-                image: NSImage(systemSymbolName: "face.smiling", accessibilityDescription: "Insert Emoji")!,
+                image: NSImage(systemSymbolName: "face.smiling", accessibilityDescription: L10n("Insert Emoji"))!,
                 selector: "insertEmoji:"
             )
         case .attachPhoto:
@@ -111,7 +102,7 @@ extension WriterWindow: NSToolbarDelegate {
             return makeToolbarButton(
                 itemIdentifier: .attachPhoto,
                 title: title,
-                image: NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: "Attach Photo")!,
+                image: NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: L10n("Attach Photo"))!,
                 selector: "attachPhoto:"
             )
         case .attachVideo:
@@ -119,7 +110,7 @@ extension WriterWindow: NSToolbarDelegate {
             return makeToolbarButton(
                 itemIdentifier: .attachVideo,
                 title: title,
-                image: NSImage(systemSymbolName: "video.badge.plus", accessibilityDescription: "Attach Video")!,
+                image: NSImage(systemSymbolName: "video.badge.plus", accessibilityDescription: L10n("Attach Video"))!,
                 selector: "attachVideo:"
             )
         case .attachAudio:
@@ -127,7 +118,7 @@ extension WriterWindow: NSToolbarDelegate {
             return makeToolbarButton(
                 itemIdentifier: .attachAudio,
                 title: title,
-                image: NSImage(systemSymbolName: "waveform.badge.plus", accessibilityDescription: "Attach Audio")!,
+                image: NSImage(systemSymbolName: "waveform.badge.plus", accessibilityDescription: L10n("Attach Audio"))!,
                 selector: "attachAudio:"
             )
 
@@ -227,6 +218,8 @@ extension WriterWindow: NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        viewModel.clearVideoCompressionBackup()
+        viewModel.clearVideoCompressionSummary()
         Task { @MainActor in
             WriterStore.shared.closeWriterWindow(byDraftID: self.draft.id)
         }

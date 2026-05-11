@@ -12,11 +12,14 @@ struct PublicArticleModel: Codable {
     let id: UUID
     let link: String
     var slug: String? = ""
+    var articleNumber: Int? = nil
+    var articleReference: String? = nil
     var externalLink: String? = ""
     let title: String
     let content: String
     let contentRendered: String?
     let created: Date
+    var modified: Date? = nil
     let hasVideo: Bool?
     let videoFilename: String?
     let hasAudio: Bool?

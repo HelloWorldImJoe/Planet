@@ -34,6 +34,8 @@ struct MyArticleSettingsView: View {
 
     @State private var isIncludedInNavigation: Bool
     @State private var navigationWeight: String
+    @State private var articleReferenceCopied: Bool = false
+    @State private var articleReferenceCopyFeedbackToken: UUID? = nil
 
     init(article: MyArticleModel) {
         self.article = article
@@ -53,6 +55,27 @@ struct MyArticleSettingsView: View {
                 HStack(spacing: 10) {
                     article.planet.smallAvatarAndNameView()
                     Spacer()
+                    if let articleReference = article.articleReference {
+                        Button {
+                            copyArticleReference(articleReference)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(articleReference)
+                                    .font(.body)
+                                    .foregroundColor(.secondary)
+
+                                Image(
+                                    systemName: articleReferenceCopied
+                                        ? "checkmark.circle.fill" : "square.on.square"
+                                )
+                                .foregroundColor(articleReferenceCopied ? .green : .secondary)
+                                .frame(width: 16, height: 16)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(articleReferenceCopied ? "Copied" : "Copy reference")
+                    }
                 }
 
                 TabView(selection: $selectedTab) {
@@ -197,7 +220,7 @@ struct MyArticleSettingsView: View {
                         article.navigationWeight = Int(navigationWeight)
                         article.tags = tags
                         Task {
-                            try article.save()
+                            try article.save(markingModified: true)
                             if let previousSlug = previousSlug, slugChanged, previousSlug.count > 0 {
                                 article.removeSlug(previousSlug)
                             }
@@ -225,6 +248,30 @@ struct MyArticleSettingsView: View {
         }
         .padding(0)
         .frame(width: 520, height: nil, alignment: .top)
+    }
+
+    private func copyArticleReference(_ articleReference: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(articleReference, forType: .string)
+
+        let feedbackToken = UUID()
+        articleReferenceCopyFeedbackToken = feedbackToken
+        withAnimation(.easeInOut(duration: 0.15)) {
+            articleReferenceCopied = true
+        }
+
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            await MainActor.run {
+                guard articleReferenceCopyFeedbackToken == feedbackToken else {
+                    return
+                }
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    articleReferenceCopied = false
+                }
+                articleReferenceCopyFeedbackToken = nil
+            }
+        }
     }
 
     @ViewBuilder
@@ -372,10 +419,10 @@ extension MyArticleSettingsView {
                 errors = errors + 1
 
                 let alert = NSAlert()
-                alert.messageText = "Article Slug Issue"
+                alert.messageText = L10n("Article Slug Issue")
                 alert.informativeText = MESSAGE_SLUG_REQUIREMENT
                 alert.alertStyle = .informational
-                alert.addButton(withTitle: "OK")
+                alert.addButton(withTitle: L10n("OK"))
                 alert.runModal()
             }
             else {
@@ -387,11 +434,11 @@ extension MyArticleSettingsView {
                             errors = errors + 1
 
                             let alert = NSAlert()
-                            alert.messageText = "Article Slug Issue"
+                            alert.messageText = L10n("Article Slug Issue")
                             alert.informativeText =
                                 "The slug is already used by \(article.title) (ID: \(article.id)). Please choose a different slug."
                             alert.alertStyle = .informational
-                            alert.addButton(withTitle: "OK")
+                            alert.addButton(withTitle: L10n("OK"))
                             alert.runModal()
                             break
                         }

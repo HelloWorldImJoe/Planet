@@ -1,0 +1,7 @@
+config.py
+*.pyc
+*.pyo
+insider/*.md
+release/*.md
+.gh_synced
+.planet_synced

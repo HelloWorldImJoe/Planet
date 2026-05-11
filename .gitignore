@@ -1,6 +1,11 @@
 .idea
+.claude
 .vscode
+.ruby-version
 *.DS_Store
 local.xcconfig
 xcuserdata
 archive/
+.agents/
+skills/
+skills-lock.json

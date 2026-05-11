@@ -1,5 +1,9 @@
 import SwiftUI
 
+#if PLANET_ENABLE_APPLE_INTELLIGENCE && canImport(FoundationModels)
+import FoundationModels
+#endif
+
 
 struct PlanetRebuildView: View {
     @ObservedObject var planet: MyPlanetModel
@@ -22,7 +26,7 @@ struct PlanetRebuildView: View {
                             catch {
                                 DispatchQueue.main.async {
                                     PlanetStore.shared.isShowingAlert = true
-                                    PlanetStore.shared.alertTitle = "Failed to Rebuild Planet"
+                                    PlanetStore.shared.alertTitle = L10n("Failed to Rebuild Planet")
                                     PlanetStore.shared.alertMessage = error.localizedDescription
                                 }
                             }
@@ -41,7 +45,7 @@ struct PlanetRebuildView: View {
                             catch {
                                 Task { @MainActor in
                                     PlanetStore.shared.isShowingAlert = true
-                                    PlanetStore.shared.alertTitle = "Failed to Quick Rebuild Planet"
+                                    PlanetStore.shared.alertTitle = L10n("Failed to Quick Rebuild Planet")
                                     PlanetStore.shared.alertMessage = error.localizedDescription
                                 }
                             }
@@ -227,21 +231,35 @@ struct ArticleSetStarView: View {
 struct ArticleView: View {
     static let noSelectionURL = Bundle.main.url(forResource: "NoSelection.html", withExtension: "")!
     @EnvironmentObject var planetStore: PlanetStore
+    @ObservedObject private var ipfsState = IPFSState.shared
+    @ObservedObject private var speechPlayerViewModel = ArticleSpeechPlayerViewModel.shared
+    @AppStorage(String.settingsAIIsReady) private var settingsAIIsReady: Bool = false
+    @State private var isOnDeviceAIAvailable: Bool = false
 
     @State private var url: URL = Self.noSelectionURL
     @State private var isShowingAnalyticsPopover: Bool = false
     @State private var selectedAttachment: String? = nil
 
     @State private var isSharing: Bool = false
+    @State private var aiChatResponseCount: Int = 0
+    @State private var showLocalRendered: Bool = false
+    @AppStorage(String.settingsReaderFontSize) private var readerFontSize: Double = 14
 
+    @State private var readerFontSizeKeyMonitor: Any? = nil
+    @State private var detectedSpeechLanguage: String? = nil
+    @State private var isDetectingSpeechLanguage: Bool = false
+    @State private var speechLanguageDetectionTask: Task<Void, Never>? = nil
     @State private var sharingItem: URL?
     @State private var currentItemHost: String? = nil
     @State private var currentItemLink: String? = nil
+    @State private var themeColor: NSColor? = nil
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         VStack(spacing: 0) {
-            ArticleWebView(url: $url)
+            ArticleWebView(url: $url, themeColor: $themeColor)
             ArticleAudioPlayer()
+            ArticleSpeechPlayer()
             if let article = planetStore.selectedArticle, let myArticle = article as? MyArticleModel, let planet = myArticle.planet {
                 PlanetRebuildView(planet: planet)
             }
@@ -251,176 +269,328 @@ struct ArticleView: View {
         }
         .frame(minWidth: 400)
         .background(
-            Color(NSColor.textBackgroundColor)
+            Color(themeColor ?? NSColor.textBackgroundColor)
+                .edgesIgnoringSafeArea(.all)
         )
-        .onChange(of: planetStore.selectedArticle) { newArticle in
-            if let myArticle = newArticle as? MyArticleModel {
-                if myArticle.planet.templateName == "Croptop" {
-                    if FileManager.default.fileExists(atPath: myArticle.publicSimplePath.path) {
-                        let now = Date()
-                        let simpleHTMLAge =
-                            now.timeIntervalSince1970
-                            - ((try? FileManager.default.attributesOfItem(
-                                atPath: myArticle.publicSimplePath.path
-                            )[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
-                        if simpleHTMLAge < 7 {
-                            url = myArticle.publicSimplePath
-                        }
-                        else {
-                            url = myArticle.localPreviewURL ?? myArticle.publicIndexPath
-                        }
-                    }
-                    else {
-                        url = myArticle.localPreviewURL ?? myArticle.publicIndexPath
-                    }
-                }
-                else {
-                    // in future we can use the local gateway for all planets
-                    url = myArticle.publicIndexPath
-                }
-                sharingItem = myArticle.browserURL?.absoluteURL
-                currentItemLink = myArticle.link
-            }
-            else if let followingArticle = newArticle as? FollowingArticleModel {
-                if let webviewURL = followingArticle.webviewURL {
-                    url = webviewURL
-                }
-                else {
-                    debugPrint("Failed to switch selected article - branch A")
-                    url = Self.noSelectionURL
-                }
-                sharingItem = followingArticle.browserURL?.absoluteURL
-                currentItemLink = followingArticle.link
-                if followingArticle.planet.planetType == .ens {
-                    currentItemHost = followingArticle.planet.link
-                }
-                if followingArticle.planet.planetType == .dotbit {
-                    currentItemHost = followingArticle.planet.link
-                }
-            }
-            else {
-                debugPrint("Failed to switch selected article - branch B")
-                url = Self.noSelectionURL
-                currentItemLink = nil
-                planetStore.walletTransactionMemo = ""
-            }
-            if let linkString = currentItemLink, !linkString.hasPrefix("/"),
-                let linkURL = URL(string: linkString)
-            {
-                var link = linkURL.path
-                if let query = linkURL.query {
-                    link.append("?" + query)
-                }
-                if let fragment = linkURL.fragment {
-                    link.append("#" + fragment)
-                }
-                currentItemLink = link
-            }
-            debugPrint("Current item link is \(currentItemLink ?? "nil")")
-            if let host = currentItemHost {
-                planetStore.walletTransactionMemo = "planet:\(host)"
-                if let link = currentItemLink {
-                    planetStore.walletTransactionMemo = "planet:\(host)\(link)"
-                }
-            }
-            debugPrint(
-                "Current prepared transaction memo is \(planetStore.walletTransactionMemo)"
-            )
-            NotificationCenter.default.post(name: .loadArticle, object: nil)
+        .onChange(of: planetStore.selectedArticle) { _ in
+            syncReaderViewPreference()
+            syncSelectedArticlePresentation()
+            refreshAIChatResponseCount()
+            detectSpeechLanguage()
         }
         .onChange(of: planetStore.selectedView) { _ in
-            url = Self.noSelectionURL
-            currentItemLink = nil
-            planetStore.walletTransactionMemo = ""
-            NotificationCenter.default.post(name: .loadArticle, object: nil)
-            switch planetStore.selectedView {
-            case .followingPlanet(let followingPlanet):
-                planetStore.walletTransactionMemo = "planet:\(followingPlanet.link)"
-            default:
-                break
+            if planetStore.selectedArticle == nil {
+                syncReaderViewPreference()
+                syncSelectedArticlePresentation()
             }
+            refreshAIChatResponseCount()
+        }
+        .onChange(of: ipfsState.online) { online in
+            handleIPFSOnlineChange(online)
+        }
+        .onChange(of: colorScheme) { _ in
+            reExtractThemeColor()
         }
         .onAppear {
-            switch planetStore.selectedView {
-            case .followingPlanet(let followingPlanet):
-                planetStore.walletTransactionMemo = "planet:\(followingPlanet.link)"
-            default:
-                break
-            }
+            syncReaderViewPreference()
+            syncSelectedArticlePresentation()
+            refreshAIChatResponseCount()
+            checkOnDeviceAIAvailability()
+            installReaderFontSizeKeyMonitor()
+            detectSpeechLanguage()
+        }
+        .onDisappear {
+            speechLanguageDetectionTask?.cancel()
+            speechLanguageDetectionTask = nil
+            removeReaderFontSizeKeyMonitor()
         }
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
                 // Functions for the current selected planet
-                toolbarPlanetView()
+                Group {
+                    toolbarPlanetView()
+                    toolbarArticlePlanetAvatarView()
+                }
+                .darkThemeToolbarStyle(isDarkThemeColor)
             }
 
             ToolbarItemGroup(placement: .automatic) {
                 Spacer()
-                if let article = planetStore.selectedArticle {
-                    Menu {
-                        ArticleSetStarView(article: article)
-                    } label: {
-                        ArticleToolbarStarView(article: article)
+                Group {
+                    if let article = planetStore.selectedArticle {
+                        Menu {
+                            ArticleSetStarView(article: article)
+                        } label: {
+                            ArticleToolbarStarView(article: article)
+                        }
+                    }
+
+                    if let article = planetStore.selectedArticle,
+                        article.hasAudio
+                    {
+                        toolbarAudioView(article: article)
+                    }
+
+                    // Menu for accessing the attachments if any
+                    if let article = planetStore.selectedArticle, let attachments = article.attachments,
+                        attachments.count > 0
+                    {
+                        toolbarAttachmentsView(article: article)
+                    }
+
+                    if (settingsAIIsReady || isOnDeviceAIAvailable), let article = planetStore.selectedArticle {
+                        Button {
+                            ArticleAIChatWindowManager.shared.open(for: article)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "sparkles")
+                                if aiChatResponseCount > 0 {
+                                    Text("\(aiChatResponseCount)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .help("Chat with AI about this article")
+                    }
+
+                    if let followingArticle = planetStore.selectedArticle as? FollowingArticleModel {
+                        if followingArticle.supportsReaderView {
+                            Button {
+                                setReaderViewEnabled(!showLocalRendered, for: followingArticle.planet)
+                                syncSelectedArticlePresentation()
+                            } label: {
+                                Image(systemName: showLocalRendered ? "globe" : "doc.richtext")
+                            }
+                            .help(showLocalRendered ? "Show Original Website" : "Show Reader View")
+                        }
+
+                        if followingArticle.supportsReadAloud {
+                            Button {
+                                toggleSpeechPlayback(for: followingArticle)
+                            } label: {
+                                Image(systemName: speechPlayerViewModel.isSpeaking ? "speaker.wave.2.fill" : "speaker.wave.2")
+                            }
+                            .disabled(detectedSpeechLanguage == nil)
+                            .help(speechPlaybackHelpText())
+                        }
+                    }
+
+                    if let article = planetStore.selectedArticle as? MyArticleModel, !article.isAggregated() {
+                        Button {
+                            do {
+                                try WriterStore.shared.editArticle(for: article)
+                            }
+                            catch {
+                                PlanetStore.shared.alert(title: "Failed to launch writer")
+                            }
+                        } label: {
+                            Image(systemName: "pencil.line")
+                        }
+                        .help("Edit Selected Article")
+                        .keyboardShortcut("e", modifiers: [.command])
                     }
                 }
-
-                if let article = planetStore.selectedArticle,
-                    article.hasAudio
-                {
-                    toolbarAudioView(article: article)
-                }
-
-                // Menu for accessing the attachments if any
-                if let article = planetStore.selectedArticle, let attachments = article.attachments,
-                    attachments.count > 0
-                {
-                    toolbarAttachmentsView(article: article)
-                }
-
-                if let article = planetStore.selectedArticle as? MyArticleModel, !article.isAggregated() {
-                    Button {
-                        do {
-                            try WriterStore.shared.editArticle(for: article)
-                        }
-                        catch {
-                            PlanetStore.shared.alert(title: "Failed to launch writer")
-                        }
-                    } label: {
-                        Image(systemName: "pencil.line")
-                    }
-                    .help("Edit Selected Article")
-                    .keyboardShortcut("e", modifiers: [.command])
-                }
+                .darkThemeToolbarStyle(isDarkThemeColor)
             }
 
             ToolbarItemGroup(placement: .automatic) {
                 Spacer()
-                Button {
-                    planetStore.isShowingSearch = true
-                } label: {
-                    Image(systemName: "magnifyingglass")
-                }
-                .help("Search")
-                .keyboardShortcut("f", modifiers: [.command])
-
-                if let _ = planetStore.selectedArticle {
+                Group {
                     Button {
-                        isSharing = true
+                        planetStore.isShowingSearch = true
                     } label: {
-                        Image(systemName: "square.and.arrow.up")
+                        Image(systemName: "magnifyingglass")
                     }
-                    .background(
-                        SharingServicePicker(
-                            isPresented: $isSharing,
-                            sharingItems: [
-                                sharingItem ?? URL(string: "https://planetable.eth.limo")!
-                            ]
+                    .help("Search")
+                    .keyboardShortcut("f", modifiers: [.command])
+
+                    if let _ = planetStore.selectedArticle {
+                        Button {
+                            isSharing = true
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .background(
+                            SharingServicePicker(
+                                isPresented: $isSharing,
+                                sharingItems: [
+                                    sharingItem ?? URL(string: "https://planetable.eth.limo")!
+                                ]
+                            )
                         )
-                    )
-                    .help("Share Selected Article")
+                        .help("Share Selected Article")
+                    }
                 }
+                .darkThemeToolbarStyle(isDarkThemeColor)
             }
         }
+    }
+
+    private func chatFileURL(for article: ArticleModel) -> URL? {
+        if let myArticle = article as? MyArticleModel {
+            return myArticle.path.deletingLastPathComponent().appendingPathComponent(
+                "\(myArticle.id.uuidString)-chats.json"
+            )
+        }
+        if let followingArticle = article as? FollowingArticleModel {
+            return followingArticle.path.deletingLastPathComponent().appendingPathComponent(
+                "\(followingArticle.id.uuidString)-chats.json"
+            )
+        }
+        return nil
+    }
+
+    private func checkOnDeviceAIAvailability() {
+        guard FeatureFlags.appleIntelligenceSupport else {
+            isOnDeviceAIAvailable = false
+            return
+        }
+
+        #if PLANET_ENABLE_APPLE_INTELLIGENCE && canImport(FoundationModels)
+        if #available(macOS 26.0, *) {
+            let model = SystemLanguageModel.default
+            if case .available = model.availability {
+                isOnDeviceAIAvailable = true
+                return
+            }
+        }
+        #endif
+        isOnDeviceAIAvailable = false
+    }
+
+    private func detectSpeechLanguage() {
+        speechLanguageDetectionTask?.cancel()
+        speechLanguageDetectionTask = nil
+        detectedSpeechLanguage = nil
+        isDetectingSpeechLanguage = false
+        guard let followingArticle = planetStore.selectedArticle as? FollowingArticleModel,
+            followingArticle.supportsReadAloud
+        else { return }
+        let text = followingArticle.title + " " + followingArticle.content
+        isDetectingSpeechLanguage = true
+        speechLanguageDetectionTask = Task.detached(priority: .utility) {
+            let lang = ArticleSpeechPlayerViewModel.detectLanguage(of: text)
+            let supported = lang.map { ArticleSpeechPlayerViewModel.hasVoices(forLanguage: $0) } ?? false
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                detectedSpeechLanguage = supported ? lang : nil
+                isDetectingSpeechLanguage = false
+                speechLanguageDetectionTask = nil
+            }
+        }
+    }
+
+    private func toggleSpeechPlayback(for article: FollowingArticleModel) {
+        guard let language = detectedSpeechLanguage else { return }
+        if speechPlayerViewModel.isSpeaking {
+            speechPlayerViewModel.stop()
+        } else {
+            let text = ArticleSpeechPlayerViewModel.extractPlainText(from: article)
+            speechPlayerViewModel.speak(text: text, title: article.title, language: language)
+        }
+    }
+
+    private func speechPlaybackHelpText() -> String {
+        if speechPlayerViewModel.isSpeaking {
+            return L10n("Stop Reading Aloud")
+        }
+        if detectedSpeechLanguage != nil {
+            return L10n("Read Aloud")
+        }
+        if isDetectingSpeechLanguage {
+            return L10n("Checking Read Aloud Availability")
+        }
+        return L10n("Read Aloud Unavailable")
+    }
+
+    private func syncReaderViewPreference() {
+        guard let followingArticle = planetStore.selectedArticle as? FollowingArticleModel,
+            followingArticle.supportsReaderView
+        else {
+            showLocalRendered = false
+            return
+        }
+        showLocalRendered = preferredReaderView(for: followingArticle.planet)
+    }
+
+    private func preferredReaderView(for planet: FollowingPlanetModel) -> Bool {
+        let key = String.settingsPreferReaderView(forFollowingPlanetID: planet.id)
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: key) != nil {
+            return defaults.bool(forKey: key)
+        }
+        return defaults.bool(forKey: String.settingsPreferReaderView)
+    }
+
+    private func setReaderViewEnabled(_ enabled: Bool, for planet: FollowingPlanetModel) {
+        let key = String.settingsPreferReaderView(forFollowingPlanetID: planet.id)
+        UserDefaults.standard.set(enabled, forKey: key)
+        showLocalRendered = enabled
+    }
+
+    private func installReaderFontSizeKeyMonitor() {
+        guard readerFontSizeKeyMonitor == nil else { return }
+        readerFontSizeKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [self] event in
+            guard event.modifierFlags.contains(.command),
+                !event.modifierFlags.contains(.shift),
+                !event.modifierFlags.contains(.option),
+                showLocalRendered,
+                planetStore.selectedArticle is FollowingArticleModel
+            else { return event }
+            switch event.charactersIgnoringModifiers {
+            case "+", "=":
+                readerFontSize = min(24, readerFontSize + 1)
+                NotificationCenter.default.post(
+                    name: .readerFontSizeChanged,
+                    object: NSNumber(value: Int(readerFontSize))
+                )
+                return nil
+            case "-":
+                readerFontSize = max(10, readerFontSize - 1)
+                NotificationCenter.default.post(
+                    name: .readerFontSizeChanged,
+                    object: NSNumber(value: Int(readerFontSize))
+                )
+                return nil
+            case "0":
+                readerFontSize = 14
+                NotificationCenter.default.post(
+                    name: .readerFontSizeChanged,
+                    object: NSNumber(value: 14)
+                )
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func removeReaderFontSizeKeyMonitor() {
+        if let monitor = readerFontSizeKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            readerFontSizeKeyMonitor = nil
+        }
+    }
+
+    private func refreshAIChatResponseCount() {
+        guard let article = planetStore.selectedArticle,
+            let chatFileURL = chatFileURL(for: article),
+            let data = try? Data(contentsOf: chatFileURL)
+        else {
+            aiChatResponseCount = 0
+            return
+        }
+        let persistedMessages: [ArticleAIChatPersistedMessage]
+        if let envelope = try? JSONDecoder.shared.decode(ArticleAIChatPersistedData.self, from: data) {
+            persistedMessages = envelope.messages
+        } else if let legacy = try? JSONDecoder.shared.decode([ArticleAIChatPersistedMessage].self, from: data) {
+            persistedMessages = legacy
+        } else {
+            aiChatResponseCount = 0
+            return
+        }
+        aiChatResponseCount = persistedMessages.filter { $0.role == "assistant" }.count
     }
 
     private func canTip(planet: FollowingPlanetModel) -> String? {
@@ -469,6 +639,143 @@ struct ArticleView: View {
         conf.hides = false
         conf.activates = true
         return conf
+    }
+
+    private func syncSelectedArticlePresentation() {
+        currentItemHost = nil
+        currentItemLink = nil
+        sharingItem = nil
+        planetStore.walletTransactionMemo = ""
+
+        if let myArticle = planetStore.selectedArticle as? MyArticleModel {
+            url = articleURL(for: myArticle)
+            sharingItem = myArticle.browserURL?.absoluteURL
+            currentItemLink = myArticle.link
+        } else if let followingArticle = planetStore.selectedArticle as? FollowingArticleModel {
+            if showLocalRendered, followingArticle.supportsReaderView,
+                let localURL = try? followingArticle.renderLocalPreview(fontSize: CGFloat(readerFontSize))
+            {
+                url = localURL
+            } else if let webviewURL = followingArticle.webviewURL {
+                url = webviewURL
+            } else {
+                debugPrint("Failed to switch selected article - branch A")
+                url = Self.noSelectionURL
+            }
+            sharingItem = followingArticle.browserURL?.absoluteURL
+            currentItemLink = followingArticle.link
+            if followingArticle.planet.planetType == .ens
+                || followingArticle.planet.planetType == .dotbit
+            {
+                currentItemHost = followingArticle.planet.link
+            }
+        } else {
+            debugPrint("Failed to switch selected article - branch B")
+            url = Self.noSelectionURL
+        }
+
+        // Pre-extract theme-color for local HTML files.
+        // For remote URLs, keep the current color until JS extraction reports in didFinish.
+        if url.isFileURL {
+            themeColor = ThemeColorExtractor.extractColor(from: url)
+        }
+        #if DEBUG
+        ThemeColorExtractor.debugLog(
+            "syncPresentation: url=\(url.lastPathComponent) themeColor=\(String(describing: themeColor))"
+        )
+        #endif
+
+        normalizeCurrentItemLink()
+
+        if let host = currentItemHost {
+            planetStore.walletTransactionMemo = "planet:\(host)"
+            if let link = currentItemLink {
+                planetStore.walletTransactionMemo = "planet:\(host)\(link)"
+            }
+        } else if case .followingPlanet(let followingPlanet) = planetStore.selectedView,
+            planetStore.selectedArticle == nil
+        {
+            planetStore.walletTransactionMemo = "planet:\(followingPlanet.link)"
+        }
+
+        debugPrint("Current item link is \(currentItemLink ?? "nil")")
+        debugPrint(
+            "Current prepared transaction memo is \(planetStore.walletTransactionMemo)"
+        )
+    }
+
+    private var isDarkThemeColor: Bool {
+        guard let color = themeColor else { return false }
+        return ThemeColorExtractor.isDark(color)
+    }
+
+    private func reExtractThemeColor() {
+        guard url.isFileURL else { return }
+        themeColor = ThemeColorExtractor.extractColor(from: url)
+    }
+
+    private func handleIPFSOnlineChange(_ online: Bool) {
+        guard online, planetStore.selectedArticle != nil else {
+            return
+        }
+
+        let previousURL = url
+        syncSelectedArticlePresentation()
+
+        guard usesLocalGateway(url) else {
+            return
+        }
+        guard previousURL == url else {
+            return
+        }
+
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .loadArticle, object: nil)
+        }
+    }
+
+    private func usesLocalGateway(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "127.0.0.1" || host == "localhost"
+    }
+
+    private func articleURL(for myArticle: MyArticleModel) -> URL {
+        if myArticle.planet.templateName == "Croptop" {
+            if FileManager.default.fileExists(atPath: myArticle.publicSimplePath.path) {
+                let now = Date()
+                let simpleHTMLAge = now.timeIntervalSince1970 - (
+                    (try? FileManager.default.attributesOfItem(
+                        atPath: myArticle.publicSimplePath.path
+                    )[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+                )
+                if simpleHTMLAge < 7 {
+                    return myArticle.publicSimplePath
+                }
+            }
+            return myArticle.localPreviewURL ?? myArticle.publicIndexPath
+        }
+
+        // In future we can use the local gateway for all planets.
+        return myArticle.publicIndexPath
+    }
+
+    private func normalizeCurrentItemLink() {
+        guard let linkString = currentItemLink, !linkString.hasPrefix("/"),
+            let linkURL = URL(string: linkString)
+        else {
+            return
+        }
+
+        var link = linkURL.path
+        if let query = linkURL.query {
+            link.append("?" + query)
+        }
+        if let fragment = linkURL.fragment {
+            link.append("#" + fragment)
+        }
+        currentItemLink = link
     }
 
     @ViewBuilder
@@ -550,6 +857,97 @@ struct ArticleView: View {
                 ArticleAudioPlayerViewModel.shared.title = followingArticle.title
             } label: {
                 Label("Play Audio", systemImage: "headphones")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func toolbarArticlePlanetAvatarView() -> some View {
+        if let myArticle = planetStore.selectedArticle as? MyArticleModel,
+            let articlePlanet = myArticle.planet
+        {
+            if case .myPlanet(let selectedPlanet) = planetStore.selectedView,
+                selectedPlanet.id == articlePlanet.id
+            {
+                EmptyView()
+            } else {
+                Button {
+                    let targetArticleID = myArticle.id
+                    let targetPlanet = articlePlanet
+                    planetStore.selectedView = .myPlanet(targetPlanet)
+                    NotificationCenter.default.post(name: .scrollToSidebarItem, object: "sidebar-my-\(targetPlanet.id.uuidString)")
+                    Task { @MainActor in
+                        await restoreMyArticleSelection(
+                            targetArticleID: targetArticleID,
+                            targetPlanetID: targetPlanet.id
+                        )
+                    }
+                } label: {
+                    articlePlanet.avatarView(size: 20)
+                }
+                .help("Show \(articlePlanet.name)")
+            }
+        } else if let followingArticle = planetStore.selectedArticle as? FollowingArticleModel,
+            let articlePlanet = followingArticle.planet
+        {
+            if case .followingPlanet(let selectedPlanet) = planetStore.selectedView,
+                selectedPlanet.id == articlePlanet.id
+            {
+                EmptyView()
+            } else {
+                Button {
+                    let targetArticleID = followingArticle.id
+                    let targetPlanet = articlePlanet
+                    planetStore.selectedView = .followingPlanet(targetPlanet)
+                    NotificationCenter.default.post(name: .scrollToSidebarItem, object: "sidebar-following-\(targetPlanet.id.uuidString)")
+                    Task { @MainActor in
+                        await restoreFollowingArticleSelection(
+                            targetArticleID: targetArticleID,
+                            targetPlanetID: targetPlanet.id
+                        )
+                    }
+                } label: {
+                    articlePlanet.avatarView(size: 20)
+                }
+                .help("Show \(articlePlanet.name)")
+            }
+        }
+    }
+
+    @MainActor
+    private func restoreMyArticleSelection(targetArticleID: UUID, targetPlanetID: UUID) async {
+        // Wait briefly for selectedView didSet to refresh article list before restoring selection.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        guard case .myPlanet(let selectedPlanet) = planetStore.selectedView,
+            selectedPlanet.id == targetPlanetID
+        else {
+            return
+        }
+        if let article = planetStore.selectedArticleList?.first(where: { $0.id == targetArticleID })
+            ?? selectedPlanet.articles.first(where: { $0.id == targetArticleID })
+        {
+            planetStore.selectedArticle = article
+            Task(priority: .userInitiated) {
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
+            }
+        }
+    }
+
+    @MainActor
+    private func restoreFollowingArticleSelection(targetArticleID: UUID, targetPlanetID: UUID) async {
+        // Wait briefly for selectedView didSet to refresh article list before restoring selection.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        guard case .followingPlanet(let selectedPlanet) = planetStore.selectedView,
+            selectedPlanet.id == targetPlanetID
+        else {
+            return
+        }
+        if let article = planetStore.selectedArticleList?.first(where: { $0.id == targetArticleID })
+            ?? selectedPlanet.articles.first(where: { $0.id == targetArticleID })
+        {
+            planetStore.selectedArticle = article
+            Task(priority: .userInitiated) {
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
             }
         }
     }
@@ -658,7 +1056,20 @@ struct ArticleView: View {
                 }.help("Visit Juicebox Project")
             }
         default:
-            Text("")
+            EmptyView()
+        }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func darkThemeToolbarStyle(_ isDark: Bool) -> some View {
+        if #available(macOS 26, *) {
+            self
+        } else if isDark {
+            self.environment(\.colorScheme, .dark)
+        } else {
+            self
         }
     }
 }

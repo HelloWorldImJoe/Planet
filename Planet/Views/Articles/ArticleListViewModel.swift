@@ -73,12 +73,29 @@ enum ListViewFilter: String, CaseIterable {
         "Question": "questionmark.circle.fill",
         "Paperplane": "paperplane.circle.fill",
     ]
+
+    var localizedTitle: String {
+        L10n(rawValue)
+    }
+
+    var localizedButtonLabel: String {
+        L10n(Self.buttonLabels[rawValue] ?? rawValue)
+    }
+
+    var localizedEmptyLabel: String {
+        L10n(Self.emptyLabels[rawValue] ?? "No Articles")
+    }
 }
 
 
 class ArticleListViewModel: ObservableObject {
     static let shared = ArticleListViewModel()
 
-    @Published var articles: [ArticleModel] = []
+    @Published var articles: [ArticleModel] = [] {
+        didSet {
+            articlesVersion &+= 1
+        }
+    }
+    @Published private(set) var articlesVersion: UInt = 0
     @Published var filter: ListViewFilter = .all
 }

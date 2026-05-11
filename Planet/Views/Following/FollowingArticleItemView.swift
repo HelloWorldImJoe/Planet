@@ -2,6 +2,7 @@ import SwiftUI
 
 struct FollowingArticleItemView: View {
     @ObservedObject var article: FollowingArticleModel
+    var isSelected: Bool
 
     @State private var isShowingDeleteConfirmation = false
 
@@ -9,13 +10,13 @@ struct FollowingArticleItemView: View {
         HStack {
             VStack {
                 if article.starred != nil {
-                    article.starView()
+                    article.starView(isSelected: isSelected)
                 }
                 else {
                     Circle()
                         .fill(Color.blue)
                         .frame(width: 8, height: 8)
-                        .padding(.init(top: 6, leading: 4, bottom: 4, trailing: 4))
+                        .padding(.init(top: 4, leading: 4, bottom: 4, trailing: 4))
                         .visibility(article.read == nil ? .visible : .invisible)
                 }
                 Spacer()
@@ -51,7 +52,7 @@ struct FollowingArticleItemView: View {
                         Spacer()
                     }
                 }
-                .frame(height: 56)
+                .frame(height: 60, alignment: .topLeading)
                 HStack(spacing: 6) {
                     article.mediaLabels()
                 }
@@ -81,7 +82,7 @@ struct FollowingArticleItemView: View {
                 } label: {
                     Text("Delete Article")
                 }
-                Menu("Star") {
+                Menu("Add Star") {
                     ArticleSetStarView(article: article)
                 }
                 if article.starred != nil {
@@ -95,6 +96,15 @@ struct FollowingArticleItemView: View {
                         Text("Remove Star")
                     }
                 }
+                Divider()
+                Button {
+                    PlanetStore.shared.relatedArticleSource = article
+                    PlanetStore.shared.isShowingRelatedArticles = true
+                } label: {
+                    Image(systemName: "doc.text.magnifyingglass")
+                    Text("Find Related Articles")
+                }
+                Divider()
                 Button {
                     if let url = article.browserURL {
                         NSPasteboard.general.clearContents()
@@ -131,10 +141,9 @@ struct FollowingArticleItemView: View {
             }
         }
         .confirmationDialog(
-            Text(
-                "Are you sure you want to delete this article? This action will remove it from your feed. However, if the article is still available on the source, it will reappear in your feed the next time you refresh it."
-            ),
-            isPresented: $isShowingDeleteConfirmation
+            Text("Delete Article"),
+            isPresented: $isShowingDeleteConfirmation,
+            titleVisibility: .visible
         ) {
             Button(role: .destructive) {
                 Task { @MainActor in
@@ -152,6 +161,10 @@ struct FollowingArticleItemView: View {
             } label: {
                 Text("Delete")
             }
+        } message: {
+            Text(
+                "Are you sure you want to delete this article? This action will remove it from your feed. However, if the article is still available on the source, it will reappear in your feed the next time you refresh it."
+            )
         }
     }
 }

@@ -10,6 +10,7 @@ import SwiftUI
 struct PlanetSettingsView: View {
     @StateObject private var store: PlanetStore
     @StateObject private var serviceStore: PlanetPublishedServiceStore
+    let SETTINGS_WINDOW_WIDTH: CGFloat = 600
 
     init() {
         _store = StateObject(wrappedValue: PlanetStore.shared)
@@ -23,15 +24,22 @@ struct PlanetSettingsView: View {
                     Label("General", systemImage: "gearshape")
                 }
                 .tag(PlanetSettingsTab.general)
-                .frame(width: 420, height: 320)
+                .frame(width: SETTINGS_WINDOW_WIDTH)
                 .environmentObject(store)
+
+            PlanetSettingsAIView()
+                .tabItem {
+                    Label("AI", systemImage: "sparkles")
+                }
+                .tag(PlanetSettingsTab.ai)
+                .frame(width: SETTINGS_WINDOW_WIDTH, height: 420)
 
             PlanetSettingsPlanetsView()
                 .tabItem {
                     Label("Planets", systemImage: "tray.full")
                 }
                 .tag(PlanetSettingsTab.planets)
-                .frame(width: 420, height: 490)
+                .frame(width: SETTINGS_WINDOW_WIDTH, height: 490)
                 .environmentObject(store)
 
             PlanetAPIControlView()
@@ -39,14 +47,14 @@ struct PlanetSettingsView: View {
                     Label("API", systemImage: "puzzlepiece.extension")
                 }
                 .tag(PlanetSettingsTab.api)
-                .frame(width: 420, height: 240)
+                .frame(width: SETTINGS_WINDOW_WIDTH, height: 240)
 
             PlanetSettingsPublishedFoldersView()
                 .tabItem {
                     Label("Published Folders", systemImage: "server.rack")
                 }
                 .tag(PlanetSettingsTab.publishedFolders)
-                .frame(width: 420, height: 180)
+                .frame(width: SETTINGS_WINDOW_WIDTH, height: 180)
                 .environmentObject(serviceStore)
         }
     }

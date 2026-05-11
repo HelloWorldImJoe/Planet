@@ -10,6 +10,15 @@ import Cocoa
 import CommonCrypto
 import SwiftUI
 
+func L10n(_ key: String) -> String {
+    let localized = NSLocalizedString(key, comment: "")
+    return localized.isEmpty ? key : localized
+}
+
+func L10n(_ key: String, _ arguments: CVarArg...) -> String {
+    String(format: L10n(key), arguments: arguments)
+}
+
 extension Data {
     func logFormat(encoding: String.Encoding = .utf8) -> String {
         String(data: self, encoding: encoding) ?? String(describing: self)
@@ -21,6 +30,7 @@ extension String {
     static let settingsPublicGatewayIndex: String = "PlanetSettingsPublicGatewayIndexKey"
     static let settingsPreferredIPFSPublicGateway: String = "PlanetSettingsPreferredIPFSPublicGatewayKey"
     static let settingsWarnBeforeQuitIfPublishing: String = "PlanetSettingsWarnBeforeQuitIfPublishingKey"
+    static let settingsOpenLogOnError: String = "PlanetSettingsOpenLogOnErrorKey"
     static let settingsEthereumChainId: String = "PlanetSettingsEthereumChainId"
     static let settingsEthereumTipAmount: String = "PlanetSettingsEthereumTipAmount"
     static let settingsAPIEnabled: String = "PlanetSettingsAPIEnabledKey"
@@ -28,6 +38,19 @@ extension String {
     static let settingsAPIPort: String = "PlanetSettingsAPIPortKey"
     static let settingsAPIUsername: String = "PlanetSettingsAPIUsernameKey"
     static let settingsAPIPasscode: String = "PlanetSettingsAPIPasscodeKey"
+    static let settingsAIAPIBase: String = "PlanetSettingsAIAPIBaseKey"
+    static let settingsAIAPIToken: String = "PlanetSettingsAIAPITokenKey"
+    static let settingsAIPreferredModel: String = "PlanetSettingsAIPreferredModelKey"
+    static let settingsAIIsReady: String = "PlanetSettingsAIIsReadyKey"
+    static let settingsAILastChatSessionID: String = "PlanetSettingsAILastChatSessionIDKey"
+    static let settingsAIChatFontSize: String = "PlanetSettingsAIChatFontSizeKey"
+    static let settingsPreventSleep: String = "PlanetSettingsPreventSleepKey"
+    static let settingsPreferReaderView: String = "PlanetSettingsPreferReaderViewKey"
+    static let settingsReaderFontSize: String = "PlanetSettingsReaderFontSizeKey"
+    static let settingsSpeechVoicePerLanguage: String = "PlanetSettingsSpeechVoicePerLanguageKey"
+    static func settingsPreferReaderView(forFollowingPlanetID planetID: UUID) -> String {
+        "\(settingsPreferReaderView).following.\(planetID.uuidString)"
+    }
 
     func sanitized() -> String {
         // Reference: https://superuser.com/a/358861
@@ -172,8 +195,10 @@ extension Notification.Name {
 
     static let copiedIPNS = Notification.Name("PlanetCopiedIPNSNotification")
 
+    static let readerFontSizeChanged = Notification.Name("PlanetReaderFontSizeChangedNotification")
     static let scrollToTopArticleList = Notification.Name("PlanetScrollToTopArticleListNotification")
     static let scrollToArticle = Notification.Name("PlanetScrollToArticleNotification")
+    static let scrollToSidebarItem = Notification.Name("PlanetScrollToSidebarItemNotification")
 }
 
 // Writer

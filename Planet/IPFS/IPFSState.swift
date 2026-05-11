@@ -5,6 +5,7 @@ class IPFSState: ObservableObject {
     static let shared = IPFSState()
 
     static let lastUserLaunchState: String = "PlanetIPFSLastUserLaunchStateKey"
+    private let offlineRetryIntervalNanoseconds: UInt64 = 3_000_000_000
 
     /// A string to be displayed when IPFS daemon is unable to start.
     @Published var reasonIPFSNotRunning: String? = nil
@@ -21,12 +22,16 @@ class IPFSState: ObservableObject {
     @Published private(set) var repoSize: Int64?
     @Published private(set) var serverInfo: ServerInfo?
     @Published private(set) var bandwidths: [Int: IPFSBandwidth] = [:]
+    private var statusRetryTask: Task<Void, Never>?
 
     init() {
         debugPrint("IPFS State Manager Init")
         Task(priority: .userInitiated) {
+            await IPFSDaemon.shared.setupIPFS()
+            guard self.reasonIPFSNotRunning == nil else {
+                return
+            }
             do {
-                await IPFSDaemon.shared.setupIPFS()
                 try await Task.sleep(nanoseconds: 500_000_000)
                 if self.shouldAutoLaunchDaemon() {
                     try await IPFSDaemon.shared.launch()
@@ -34,7 +39,12 @@ class IPFSState: ObservableObject {
             } catch {
                 debugPrint("Failed to launch: \(error.localizedDescription), will try again shortly.")
             }
+            await self.updateStatus()
         }
+    }
+
+    deinit {
+        statusRetryTask?.cancel()
     }
 
     // MARK: -
@@ -56,9 +66,26 @@ class IPFSState: ObservableObject {
     @MainActor
     func updateOnlineStatus(_ flag: Bool) {
         self.online = flag
-        guard flag else { return }
-        Task.detached(priority: .utility) {
-            await self.updateServerInfo()
+        if flag {
+            cancelStatusRetry()
+        } else {
+            if shouldAutoLaunchDaemon() {
+                scheduleOfflineRetryIfNeeded()
+            } else {
+                cancelStatusRetry()
+            }
+        }
+    }
+
+    @MainActor
+    func updateUserLaunchPreference(_ enabled: Bool) {
+        UserDefaults.standard.setValue(enabled, forKey: Self.lastUserLaunchState)
+        if enabled {
+            if !online {
+                scheduleOfflineRetryIfNeeded()
+            }
+        } else {
+            cancelStatusRetry()
         }
     }
 
@@ -99,40 +126,16 @@ class IPFSState: ObservableObject {
     // MARK: -
 
     func updateStatus() async {
-        // verify webui online status
-        let url = URL(string: "http://127.0.0.1:\(self.apiPort)/api/v0/id")!
-        let session = URLSession(configuration: {
-            let config = URLSessionConfiguration.ephemeral
-            config.timeoutIntervalForRequest = 5
-            config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-            return config
-        }())
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.networkServiceType = .responsiveData
-        let onlineStatus: Bool
-        do {
-            let (_, response) = try await session.data(for: request)
-            if let res = response as? HTTPURLResponse, res.statusCode == 200 {
-                onlineStatus = true
-            }
-            else {
-                onlineStatus = false
-            }
-        }
-        catch {
-            onlineStatus = false
-        }
+        let healthStatus = await IPFSDaemon.shared.healthStatus(
+            apiPort: self.apiPort,
+            gatewayPort: self.gatewayPort
+        )
+        let onlineStatus = healthStatus.isOnline
         await MainActor.run {
-            self.online = onlineStatus
+            self.updateOnlineStatus(onlineStatus)
         }
-        // update current peers
         if onlineStatus {
             await self.updateServerInfo()
-        } else {
-            // Wait for 2 seconds and try again
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            await self.updateStatus()
         }
     }
 
@@ -192,6 +195,46 @@ class IPFSState: ObservableObject {
     }
 
     // MARK: -
+
+    @MainActor
+    private func scheduleOfflineRetryIfNeeded() {
+        guard shouldAutoLaunchDaemon(), reasonIPFSNotRunning == nil else {
+            cancelStatusRetry()
+            return
+        }
+        guard statusRetryTask == nil else { return }
+        let retryInterval = offlineRetryIntervalNanoseconds
+        statusRetryTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                if !self.shouldAutoLaunchDaemon() {
+                    await MainActor.run {
+                        self.cancelStatusRetry()
+                    }
+                    break
+                }
+                do {
+                    try await Task.sleep(nanoseconds: retryInterval)
+                } catch {
+                    break
+                }
+                guard !Task.isCancelled else { break }
+                if !self.shouldAutoLaunchDaemon() {
+                    await MainActor.run {
+                        self.cancelStatusRetry()
+                    }
+                    break
+                }
+                await self.updateStatus()
+            }
+        }
+    }
+
+    @MainActor
+    private func cancelStatusRetry() {
+        statusRetryTask?.cancel()
+        statusRetryTask = nil
+    }
 
     private func shouldAutoLaunchDaemon() -> Bool {
         if UserDefaults.standard.value(forKey: Self.lastUserLaunchState) != nil, !UserDefaults.standard.bool(forKey: Self.lastUserLaunchState) {

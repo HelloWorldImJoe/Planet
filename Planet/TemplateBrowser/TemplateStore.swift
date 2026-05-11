@@ -5,6 +5,7 @@ import UserNotifications
 
 class TemplateStore: ObservableObject {
     static let shared = TemplateStore()
+    static let preferredNewPlanetTemplateName = "Sepia"
 
     let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "TemplateStore")
 
@@ -109,7 +110,10 @@ class TemplateStore: ObservableObject {
             }
             if overwriteLocal {
                 logger.info("Overwriting local built-in template \(builtInTemplate.name)")
-                let source = builtInTemplate.base!
+                guard let source = builtInTemplate.base else {
+                    logger.error("Built-in template \(builtInTemplate.name) is missing its source bundle")
+                    continue
+                }
                 let directoryName = source.lastPathComponent
                 let destination = templatesPath.appendingPathComponent(
                     directoryName,
@@ -117,7 +121,10 @@ class TemplateStore: ObservableObject {
                 )
                 try? FileManager.default.removeItem(at: destination)
                 try FileManager.default.copyItem(at: source, to: destination)
-                let newTemplate = Template.from(path: destination)!
+                guard let newTemplate = Template.from(path: destination) else {
+                    logger.error("Failed to load copied built-in template at \(destination.path)")
+                    continue
+                }
                 templatesMapping[newTemplate.name] = newTemplate
             }
         }
@@ -141,6 +148,16 @@ class TemplateStore: ObservableObject {
 
     func hasTemplate(named name: String) -> Bool {
         templates.contains(where: { $0.name == name })
+    }
+
+    func defaultNewPlanetTemplateName(preferCroptop: Bool = false) -> String? {
+        if preferCroptop, hasTemplate(named: "Croptop") {
+            return "Croptop"
+        }
+        if hasTemplate(named: Self.preferredNewPlanetTemplateName) {
+            return Self.preferredNewPlanetTemplateName
+        }
+        return templates.first?.name
     }
 
     subscript(templateID: Template.ID?) -> Template? {
@@ -176,7 +193,7 @@ class TemplateStore: ObservableObject {
             NotificationCenter.default.post(name: .refreshTemplatePreview, object: nil)
             NotificationCenter.default.post(name: .templateTitleSubtitleUpdated, object: nil)
             let notification = UNMutableNotificationContent()
-            notification.title = "Template \(id) Reloaded"
+            notification.title = L10n("Template %@ Reloaded", id)
             notification.interruptionLevel = .active
             let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.1, repeats: false)
             let request = UNNotificationRequest(

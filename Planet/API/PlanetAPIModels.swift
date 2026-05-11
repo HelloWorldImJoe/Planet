@@ -20,3 +20,34 @@ struct APIPlanetArticle: Content {
     var content: String?
     var attachments: [File]?
 }
+
+
+struct APISearchResultPlanet: Content {
+    let id: UUID
+    let name: String
+    let about: String
+    let created: Date
+    let updated: Date
+}
+
+
+struct APISearchResultArticle: Content {
+    let articleID: UUID
+    let articleCreated: Date
+    let articleNumber: Int?
+    let articleReference: String?
+    let title: String
+    let preview: String
+    let planetID: UUID
+    let planetName: String
+    let relevanceScore: Double?
+    let bm25Score: Double?
+    let vectorScore: Double?
+    let source: String
+}
+
+
+struct APISearchResponse: Content {
+    let planets: [APISearchResultPlanet]
+    let articles: [APISearchResultArticle]
+}

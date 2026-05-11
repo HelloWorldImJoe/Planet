@@ -82,7 +82,7 @@ class EthereumTransaction: Codable, Identifiable {
 
     static func walletsInfoPath() -> URL {
         let url = URLUtils.repoPath().appendingPathComponent("Wallets", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }
 
@@ -92,13 +92,13 @@ class EthereumTransaction: Codable, Identifiable {
             isDirectory: true
         )
         if !FileManager.default.fileExists(atPath: walletPath.path) {
-            try! FileManager.default.createDirectory(
+            try FileManager.default.createDirectory(
                 at: walletPath,
                 withIntermediateDirectories: true
             )
         }
         let txPath = walletPath.appendingPathComponent(id + ".json", isDirectory: false)
-        try JSONEncoder.shared.encode(self).write(to: txPath)
+        try JSONEncoder.shared.encode(self).write(to: txPath, options: .atomic)
     }
 
     func exists() -> Bool {

@@ -5,17 +5,11 @@
 //  Created by Xin Liu on 11/5/23.
 //
 
+import Dispatch
 import Foundation
 
 /// Sub processes to be executed from MyArticleModel.savePublic()
 extension MyArticleModel {
-    /// Save article.md with a background thread
-    func saveMarkdownInBackground() {
-        Task(priority: .background) {
-            await self.saveMarkdown()
-        }
-    }
-
     /// Render markdown to HTML if contentRendered is nil
     func processContent() throws {
         guard self.content.count > 0, self.contentRendered == nil else { return }
@@ -218,7 +212,7 @@ extension MyArticleModel {
                 attributes: attributes
             )
             let nftData = try JSONEncoder.shared.encode(nft)
-            try nftData.write(to: publicNFTMetadataPath)
+            try nftData.write(to: publicNFTMetadataPath, options: .atomic)
             let nftMetadataCID = self.getNFTJSONCID()
             debugPrint("NFT metadata CID: \(nftMetadataCID ?? "nil")")
             let nftMetadataCIDPath = publicBasePath.appendingPathComponent("nft.json.cid.txt")
@@ -232,36 +226,39 @@ extension MyArticleModel {
     }
 
     /// Render article HTML
-    func processArticleHTML(usingTasks: Bool = false) throws {
+    func processArticleHTML() throws -> ArticleHTMLPerfBreakdown {
         guard let template = planet.template else {
             throw PlanetError.MissingTemplateError
         }
 
-        if (usingTasks) {
-            Task(priority: .userInitiated) {
-                let articleHTML = try template.render(article: self)
-                try articleHTML.data(using: .utf8)?.write(to: publicIndexPath)
-                debugPrint("HTML for \(self.title) saved to \(publicIndexPath.path)")
-            }
+        let totalStartedAt = DispatchTime.now().uptimeNanoseconds
 
-            Task(priority: .userInitiated) {
-                if template.hasSimpleHTML {
-                    let simpleHTML = try template.render(article: self, forSimpleHTML: true)
-                    try simpleHTML.data(using: .utf8)?.write(to: publicSimplePath)
-                    debugPrint("Simple HTML for \(self.title) saved to \(publicSimplePath.path)")
-                }
-            }
-        } else {
-            let articleHTML = try template.render(article: self)
-            try articleHTML.data(using: .utf8)?.write(to: publicIndexPath)
-            debugPrint("HTML for \(self.title) saved to \(publicIndexPath.path)")
+        var mainRenderPerf = ArticleTemplateRenderPerfBreakdown()
+        let articleHTML = try template.render(article: self, perf: &mainRenderPerf)
+        let mainWriteStartedAt = DispatchTime.now().uptimeNanoseconds
+        try articleHTML.data(using: .utf8)?.write(to: publicIndexPath, options: .atomic)
+        let mainWriteDuration = DispatchTime.now().uptimeNanoseconds - mainWriteStartedAt
+        debugPrint("HTML for \(self.title) saved to \(publicIndexPath.path)")
 
-            if template.hasSimpleHTML {
-                let simpleHTML = try template.render(article: self, forSimpleHTML: true)
-                try simpleHTML.data(using: .utf8)?.write(to: publicSimplePath)
-                debugPrint("Simple HTML for \(self.title) saved to \(publicSimplePath.path)")
-            }
+        var simpleRenderPerf: ArticleTemplateRenderPerfBreakdown? = nil
+        var simpleWriteDuration: UInt64? = nil
+        if template.hasSimpleHTML {
+            var perf = ArticleTemplateRenderPerfBreakdown()
+            let simpleHTML = try template.render(article: self, forSimpleHTML: true, perf: &perf)
+            let simpleWriteStartedAt = DispatchTime.now().uptimeNanoseconds
+            try simpleHTML.data(using: .utf8)?.write(to: publicSimplePath, options: .atomic)
+            simpleWriteDuration = DispatchTime.now().uptimeNanoseconds - simpleWriteStartedAt
+            simpleRenderPerf = perf
+            debugPrint("Simple HTML for \(self.title) saved to \(publicSimplePath.path)")
         }
+
+        return ArticleHTMLPerfBreakdown(
+            mainRender: mainRenderPerf,
+            mainWriteDuration: mainWriteDuration,
+            simpleRender: simpleRenderPerf,
+            simpleWriteDuration: simpleWriteDuration,
+            totalDuration: DispatchTime.now().uptimeNanoseconds - totalStartedAt
+        )
     }
 
     /// Process hero grid
@@ -297,5 +294,95 @@ extension MyArticleModel {
             }
             try? FileManager.default.copyItem(at: publicBasePath, to: publicSlugBasePath)
         }
+    }
+
+    // MARK: - Split Save for Quick Post
+
+    /// Minimal save: only renders index.html so ArticleView can display the article immediately.
+    /// Call `savePublicDeferred()` afterward to complete cover images, CIDs, hero grids, etc.
+    func savePublicMinimal() throws {
+        removeDSStore()
+        if !FileManager.default.fileExists(atPath: publicBasePath.path) {
+            try FileManager.default.createDirectory(
+                at: publicBasePath, withIntermediateDirectories: true
+            )
+        }
+        saveMarkdown()
+        try processContent()
+        _ = try processArticleHTML()
+    }
+
+    /// Complete the remaining savePublic work that was skipped by `savePublicMinimal()`:
+    /// cover images, CIDs, NFT metadata, hero grid, hero image size, slug copy, article.json, and ops.
+    func savePublicDeferred() throws {
+        try saveCoverImage()
+        savePreviewImageFromPDF()
+        let coverImageCID: String? = getCoverImageCIDIfNeeded()
+        processAttachmentCIDIfNeeded()
+        processVideoThumbnail()
+        try processNFTMetadata(with: coverImageCID)
+        processHeroGrid()
+        processHeroImageSize()
+        try JSONEncoder.shared.encode(publicArticle).write(to: publicInfoPath, options: .atomic)
+        processSlug()
+        do {
+            try self.planet.saveOps()
+        } catch {
+            debugPrint("failed to save ops to file: \(error)")
+        }
+        Task { @MainActor in
+            debugPrint("Sending notification: myArticleBuilt \(self.id) \(self.title)")
+            NotificationCenter.default.post(name: .myArticleBuilt, object: self)
+        }
+    }
+}
+
+struct ArticleHTMLPerfBreakdown {
+    let mainRender: ArticleTemplateRenderPerfBreakdown
+    let mainWriteDuration: UInt64
+    let simpleRender: ArticleTemplateRenderPerfBreakdown?
+    let simpleWriteDuration: UInt64?
+    let totalDuration: UInt64
+
+    func perfFields() -> [String] {
+        var fields = [
+            "article_html_total_breakdown_ms=\(PerfLogger.milliseconds(totalDuration))",
+            "article_html_main_markdown_ms=\(PerfLogger.milliseconds(mainRender.markdownDuration))",
+            "article_html_main_about_ms=\(PerfLogger.milliseconds(mainRender.aboutDuration))",
+            "article_html_main_context_ms=\(PerfLogger.milliseconds(mainRender.contextDuration))",
+            "article_html_main_context_has_podcast_ms=\(PerfLogger.milliseconds(mainRender.contextHasPodcastDuration))",
+            "article_html_main_context_public_planet_ms=\(PerfLogger.milliseconds(mainRender.contextPublicPlanetDuration))",
+            "article_html_main_context_site_navigation_ms=\(PerfLogger.milliseconds(mainRender.contextSiteNavigationDuration))",
+            "article_html_main_context_has_avatar_ms=\(PerfLogger.milliseconds(mainRender.contextHasAvatarDuration))",
+            "article_html_main_context_user_settings_ms=\(PerfLogger.milliseconds(mainRender.contextUserSettingsDuration))",
+            "article_html_main_context_public_article_ms=\(PerfLogger.milliseconds(mainRender.contextPublicArticleDuration))",
+            "article_html_main_context_style_css_hash_ms=\(PerfLogger.milliseconds(mainRender.contextStyleCSSHashDuration))",
+            "article_html_main_custom_code_ms=\(PerfLogger.milliseconds(mainRender.customCodeDuration))",
+            "article_html_main_stencil_ms=\(PerfLogger.milliseconds(mainRender.stencilDuration))",
+            "article_html_main_write_ms=\(PerfLogger.milliseconds(mainWriteDuration))",
+            "article_html_simple_enabled=\(simpleRender == nil ? 0 : 1)",
+        ]
+
+        if let simpleRender {
+            fields.append(contentsOf: [
+                "article_html_simple_markdown_ms=\(PerfLogger.milliseconds(simpleRender.markdownDuration))",
+                "article_html_simple_about_ms=\(PerfLogger.milliseconds(simpleRender.aboutDuration))",
+                "article_html_simple_context_ms=\(PerfLogger.milliseconds(simpleRender.contextDuration))",
+                "article_html_simple_context_has_podcast_ms=\(PerfLogger.milliseconds(simpleRender.contextHasPodcastDuration))",
+                "article_html_simple_context_public_planet_ms=\(PerfLogger.milliseconds(simpleRender.contextPublicPlanetDuration))",
+                "article_html_simple_context_site_navigation_ms=\(PerfLogger.milliseconds(simpleRender.contextSiteNavigationDuration))",
+                "article_html_simple_context_has_avatar_ms=\(PerfLogger.milliseconds(simpleRender.contextHasAvatarDuration))",
+                "article_html_simple_context_user_settings_ms=\(PerfLogger.milliseconds(simpleRender.contextUserSettingsDuration))",
+                "article_html_simple_context_public_article_ms=\(PerfLogger.milliseconds(simpleRender.contextPublicArticleDuration))",
+                "article_html_simple_context_style_css_hash_ms=\(PerfLogger.milliseconds(simpleRender.contextStyleCSSHashDuration))",
+                "article_html_simple_custom_code_ms=\(PerfLogger.milliseconds(simpleRender.customCodeDuration))",
+                "article_html_simple_stencil_ms=\(PerfLogger.milliseconds(simpleRender.stencilDuration))",
+            ])
+        }
+        if let simpleWriteDuration {
+            fields.append("article_html_simple_write_ms=\(PerfLogger.milliseconds(simpleWriteDuration))")
+        }
+
+        return fields
     }
 }

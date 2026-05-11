@@ -167,11 +167,14 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
 
     static func load(from directoryPath: URL, planet: MyPlanetModel) throws -> DraftModel {
         let draftId = directoryPath.lastPathComponent
+        guard let draftUUID = UUID(uuidString: draftId) else {
+            throw PlanetError.InvalidDraftIDError
+        }
         let draftPath = directoryPath.appendingPathComponent("Draft.json", isDirectory: false)
         let data = try Data(contentsOf: draftPath)
         let draft = try JSONDecoder.shared.decode(DraftModel.self, from: data)
-        if draft.id != UUID(uuidString: draftId) {
-            draft.id = UUID(uuidString: draftId)!
+        if draft.id != draftUUID {
+            draft.id = draftUUID
         }
         draft.target = .myPlanet(Unowned(planet))
         draft.attachments.forEach { attachment in
@@ -337,6 +340,45 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
         )
     }
 
+    @discardableResult
+    func replaceVideoAttachment(
+        _ attachment: Attachment,
+        withCompressedVideoAt compressedURL: URL,
+        compressionPreset: String
+    ) throws -> Attachment {
+        try replaceVideoAttachment(
+            attachment,
+            withVideoAt: compressedURL,
+            compressionPreset: compressionPreset
+        )
+    }
+
+    @discardableResult
+    func replaceVideoAttachment(
+        _ attachment: Attachment,
+        withVideoAt videoURL: URL,
+        compressionPreset: String?
+    ) throws -> Attachment {
+        let oldName = attachment.name
+        let oldPath = attachment.path
+        let newAttachment = try addAttachment(path: videoURL, type: .video)
+        newAttachment.videoCompressionPreset = compressionPreset
+
+        if oldName != newAttachment.name {
+            content = content.replacingOccurrences(of: oldName, with: newAttachment.name)
+        }
+
+        if oldPath != newAttachment.path,
+           !DraftModel.fileURLsReferenceSameItem(oldPath, newAttachment.path),
+           FileManager.default.fileExists(atPath: oldPath.path) {
+            try FileManager.default.removeItem(at: oldPath)
+        }
+
+        try renderPreview()
+        try save()
+        return newAttachment
+    }
+
     func deleteAttachment(name: String) {
         if let attachment = attachments.first(where: { $0.name == name }) {
             do {
@@ -381,14 +423,16 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
             name: Self.previewTemplatePath.path,
             context: ["content_html": html]
         )
-        try output.data(using: .utf8)?.write(to: previewPath)
+        try output.data(using: .utf8)?.write(to: previewPath, options: .atomic)
 
         logger.info("Rendered preview for draft \(self.id) and saved to \(self.previewPath)")
     }
 
-    func saveToArticle() throws {
+    @discardableResult
+    func saveToArticle() throws -> MyArticleModel {
         let planet: MyPlanetModel
         let article: MyArticleModel
+        var isEditingExistingArticle = false
         switch target! {
         case .myPlanet(let wrapper):
             planet = wrapper.value
@@ -411,6 +455,7 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
             articles?.sort(by: { MyArticleModel.reorder(a: $0, b: $1) })
             planet.articles = articles
         case .article(let wrapper):
+            isEditingExistingArticle = true
             article = wrapper.value
             planet = article.planet
             if let articleSlug = article.slug, articleSlug.count > 0 {
@@ -484,7 +529,7 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
                 article.summary = summary
             }
         }
-        try article.save()
+        try article.save(markingModified: isEditingExistingArticle)
         try article.savePublic()
         try delete()
         try planet.copyTemplateAssets()
@@ -531,35 +576,11 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
         }
 
         Task { @MainActor in
-            PlanetStore.shared.selectedView = .myPlanet(planet)
-            PlanetStore.shared.refreshSelectedArticles()
-            // wrap it to delay the state change
-            if planet.templateName == "Croptop" {
-                let theArticle = article
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                    // Croptop needs a delay here when it loads from the local gateway
-                    if PlanetStore.shared.selectedArticle == theArticle {
-                        NotificationCenter.default.post(name: .loadArticle, object: nil)
-                    }
-                    else {
-                        PlanetStore.shared.selectedArticle = theArticle
-                    }
-                    Task(priority: .userInitiated) {
-                        NotificationCenter.default.post(name: .scrollToArticle, object: theArticle)
-                    }
-                }
-            }
-            else {
-                if PlanetStore.shared.selectedArticle == article {
-                    NotificationCenter.default.post(name: .loadArticle, object: nil)
-                }
-                else {
-                    PlanetStore.shared.selectedArticle = article
-                }
-                Task(priority: .userInitiated) {
-                    NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                }
-            }
+            let preferredView = PlanetStore.shared.selectedView
+            await PlanetStore.shared.restoreSavedMyArticleSelection(
+                article,
+                preserving: preferredView
+            )
         }
 
         // Croptop: delete cached hero image after editing.
@@ -574,10 +595,12 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
                 }
             }
         }
+
+        return article
     }
 
     func save() throws {
-        try JSONEncoder.shared.encode(self).write(to: infoPath)
+        try JSONEncoder.shared.encode(self).write(to: infoPath, options: .atomic)
     }
 
     func delete() throws {
@@ -612,6 +635,19 @@ class DraftModel: Identifiable, Equatable, Hashable, Codable, ObservableObject {
     }
 
     // MARK: -
+
+    private static func fileURLsReferenceSameItem(_ lhs: URL, _ rhs: URL) -> Bool {
+        guard
+            let lhsIdentifier = try? lhs.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                .fileResourceIdentifier,
+            let rhsIdentifier = try? rhs.resourceValues(forKeys: [.fileResourceIdentifierKey])
+                .fileResourceIdentifier
+        else {
+            return false
+        }
+
+        return (lhsIdentifier as AnyObject).isEqual(rhsIdentifier)
+    }
 
     private func processAttachment(
         forFileName name: String,

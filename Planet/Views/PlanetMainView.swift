@@ -7,6 +7,38 @@
 
 import SwiftUI
 
+@MainActor
+final class PlanetMainWindowFocus {
+    static let shared = PlanetMainWindowFocus()
+
+    weak var window: NSWindow?
+
+    private init() {}
+}
+
+private struct PlanetMainWindowReader: NSViewRepresentable {
+    func makeNSView(context: Context) -> PlanetMainWindowReaderView {
+        PlanetMainWindowReaderView()
+    }
+
+    func updateNSView(_ nsView: PlanetMainWindowReaderView, context: Context) {
+        if let window = nsView.window {
+            PlanetMainWindowFocus.shared.window = window
+            window.titlebarAppearsTransparent = true
+        }
+    }
+}
+
+private final class PlanetMainWindowReaderView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        PlanetMainWindowFocus.shared.window = window
+        if let window = window {
+            window.titlebarAppearsTransparent = true
+            window.styleMask.insert(.fullSizeContentView)
+        }
+    }
+}
 
 struct PlanetMainView: View {
     @EnvironmentObject var planetStore: PlanetStore
@@ -24,8 +56,8 @@ struct PlanetMainView: View {
             ArticleListView()
 
             ArticleView()
-                .edgesIgnoringSafeArea(.vertical)
         }
+        .background(PlanetMainWindowReader())
         .alert(isPresented: $planetStore.isShowingAlert) {
             Alert(
                 title: Text(planetStore.alertTitle),
@@ -92,11 +124,9 @@ struct PlanetMainView: View {
                 MyPlanetTemplateSettingsView(planet: planet)
             }
         }
-        .sheet(isPresented: $planetStore.isMigrating) {
-            MigrationProgressView()
-        }
         .sheet(isPresented: $planetStore.isRebuilding) {
             RebuildProgressView()
+                .interactiveDismissDisabled()
         }
         .sheet(isPresented: $planetStore.isShowingWalletConnectV1QRCode) {
             WalletConnectV1QRCodeView(payload: planetStore.walletConnectV1ConnectionURL)
@@ -148,8 +178,14 @@ struct PlanetMainView: View {
         .sheet(isPresented: $planetStore.isShowingSearch) {
             SearchView()
         }
+        .sheet(isPresented: $planetStore.isShowingRelatedArticles) {
+            RelatedArticlesView()
+        }
         .sheet(isPresented: $planetStore.isShowingIPFSOpen) {
             IPFSOpenView()
+        }
+        .sheet(isPresented: $planetStore.isShowingIPFSID) {
+            IPFSIdentitySheetView()
         }
         .sheet(isPresented: $planetStore.isShowingOnboarding) {
             OnboardingView()

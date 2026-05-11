@@ -37,6 +37,7 @@ struct MyPlanetSidebarItem: View {
                         PlanetStore.shared.alert(title: "Failed to launch writer")
                     }
                 } label: {
+                    Image(systemName: "square.and.pencil")
                     Text("New Article")
                 }
 
@@ -46,6 +47,7 @@ struct MyPlanetSidebarItem: View {
                         PlanetStore.shared.isEditingPlanet = true
                     }
                 } label: {
+                    Image(systemName: "gearshape")
                     Text("Edit Planet")
                 }
 
@@ -57,6 +59,7 @@ struct MyPlanetSidebarItem: View {
                         NSWorkspace.shared.open(url)
                     }
                 } label: {
+                    Image(systemName: "cube")
                     Text("Open in Public Gateway")
                 }
 
@@ -65,7 +68,19 @@ struct MyPlanetSidebarItem: View {
                         NSWorkspace.shared.open(url)
                     }
                 } label: {
+                    Image(systemName: "cube")
                     Text("Open in Local Gateway")
+                }
+
+                if let url = planet.cloudflarePagesURL,
+                   let host = url.host
+                {
+                    Button {
+                        NSWorkspace.shared.open(url)
+                    } label: {
+                        Image("custom.cloudflare")
+                        Text(L10n("Open %@", host))
+                    }
                 }
 
                 Divider()
@@ -185,17 +200,13 @@ struct MyPlanetSidebarItem: View {
                         } catch PlanetError.FileExistsError {
                             Task { @MainActor in
                                 self.planetStore.isShowingAlert = true
-                                self.planetStore.alertTitle = "Failed to Share Planet Data"
-                                self.planetStore.alertMessage = """
-                                    There is already an exported Planet in the destination.
-                                    We do not recommend override your backup.
-                                    Please choose another destination, or rename your previous backup.
-                                """
+                                self.planetStore.alertTitle = L10n("Failed to Share Planet Data")
+                                self.planetStore.alertMessage = L10n("There is already an exported Planet in the destination.\nWe do not recommend overriding your backup.\nPlease choose another destination, or rename your previous backup.")
                             }
                         } catch {
                             Task { @MainActor in
                                 self.planetStore.isShowingAlert = true
-                                self.planetStore.alertTitle = "Failed to Share Planet Data"
+                                self.planetStore.alertTitle = L10n("Failed to Share Planet Data")
                                 self.planetStore.alertMessage = error.localizedDescription
                             }
                         }
@@ -208,7 +219,7 @@ struct MyPlanetSidebarItem: View {
                         } catch {
                             Task { @MainActor in
                                 self.planetStore.isShowingAlert = true
-                                self.planetStore.alertTitle = "Failed to Share Planet Data"
+                                self.planetStore.alertTitle = L10n("Failed to Share Planet Data")
                                 self.planetStore.alertMessage = error.localizedDescription
                             }
                         }
@@ -233,10 +244,9 @@ struct MyPlanetSidebarItem: View {
             }
         }
         .confirmationDialog(
-            Text(
-                "Are you sure you want to archive this planet? Archived planets will not be auto published. You can later unarchive it from settings."
-            ),
-            isPresented: $isShowingArchiveConfirmation
+            Text("Archive Planet"),
+            isPresented: $isShowingArchiveConfirmation,
+            titleVisibility: .visible
         ) {
             Button {
                 planet.archive()
@@ -250,10 +260,15 @@ struct MyPlanetSidebarItem: View {
             } label: {
                 Text("Archive")
             }
+        } message: {
+            Text(
+                "Are you sure you want to archive this planet? Archived planets will not be auto published. You can later unarchive it from settings."
+            )
         }
         .confirmationDialog(
-            Text("Are you sure you want to delete \(planet.name)? This action cannot be undone."),
-            isPresented: $isShowingDeleteConfirmation
+            Text("Delete Planet"),
+            isPresented: $isShowingDeleteConfirmation,
+            titleVisibility: .visible
         ) {
             Button(role: .destructive) {
                 try? planet.delete()
@@ -266,10 +281,13 @@ struct MyPlanetSidebarItem: View {
             } label: {
                 Text("Delete")
             }
+        } message: {
+            Text(L10n("Are you sure you want to delete %@? This action cannot be undone.", planet.name))
         }
         .confirmationDialog(
-            Text("Are you sure you want to delete this article?"),
-            isPresented: $planetStore.isShowingDeleteMyArticleConfirmation
+            Text("Delete Article"),
+            isPresented: $planetStore.isShowingDeleteMyArticleConfirmation,
+            titleVisibility: .visible
         ) {
             Button(role: .destructive) {
                 if let article = planetStore.deletingMyArticle, let planet = article.planet {
@@ -307,6 +325,8 @@ struct MyPlanetSidebarItem: View {
             } label: {
                 Text("Delete")
             }
+        } message: {
+            Text("Are you sure you want to delete this article?")
         }
     }
 
@@ -350,8 +370,8 @@ struct MyPlanetSidebarItem: View {
 
     private func exportPlanet() throws {
         let panel = NSOpenPanel()
-        panel.message = "Choose Directory to Export Planet"
-        panel.prompt = "Export"
+        panel.message = L10n("Choose Directory to Export Planet")
+        panel.prompt = L10n("Export")
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.folder]
         panel.canChooseDirectories = true
@@ -407,6 +427,13 @@ struct MyPlanetSidebarItem: View {
 
         Button {
             NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(planet.id.uuidString, forType: .string)
+        } label: {
+            Text("Copy UUID")
+        }
+
+        Button {
+            NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(planet.ipns, forType: .string)
         } label: {
             Text("Copy IPNS")
@@ -443,7 +470,7 @@ struct MyPlanetSidebarItem: View {
                     catch {
                         Task { @MainActor in
                             self.planetStore.isShowingAlert = true
-                            self.planetStore.alertTitle = "Failed to Quick Rebuild Planet"
+                            self.planetStore.alertTitle = L10n("Failed to Quick Rebuild Planet")
                             self.planetStore.alertMessage = error.localizedDescription
                         }
                     }
@@ -463,7 +490,7 @@ struct MyPlanetSidebarItem: View {
                     catch {
                         Task { @MainActor in
                             self.planetStore.isShowingAlert = true
-                            self.planetStore.alertTitle = "Failed to Rebuild Planet"
+                            self.planetStore.alertTitle = L10n("Failed to Rebuild Planet")
                             self.planetStore.alertMessage = error.localizedDescription
                         }
                     }

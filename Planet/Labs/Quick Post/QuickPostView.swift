@@ -10,9 +10,19 @@ import SwiftUI
 struct QuickPostView: View {
     @StateObject private var viewModel: QuickPostViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var previousContent: String = ""
     init() {
         _viewModel = StateObject(wrappedValue: QuickPostViewModel.shared)
+    }
+
+    private var textAreaHeight: CGFloat {
+        let font = NSFont(name: "Menlo", size: 14.0) ?? NSFont.systemFont(ofSize: 14.0)
+        let lineHeight = ceil(font.ascender - font.descender + font.leading) + 4 // 4 = lineSpacing
+        let insets: CGFloat = 8 // textContainerInset.height * 2
+        let padding: CGFloat = 20 // SwiftUI top + bottom padding
+        let minHeight = lineHeight * 5 + insets + padding
+        let maxHeight = lineHeight * 12 + insets + padding
+        let needed = viewModel.textContentHeight + padding
+        return max(minHeight, min(maxHeight, needed))
     }
 
     var body: some View {
@@ -32,34 +42,22 @@ struct QuickPostView: View {
                 .padding(.leading, 10)
                 .padding(.trailing, 0)
 
-                TextEditor(text: $viewModel.content)
-                    //.font(.system(size: 14, weight: .regular, design: .default))
-                    .font(.custom("Menlo", size: 14.0))
-                    .lineSpacing(4.0)
-                    .disableAutocorrection(true)
+                QuickPostTextView(
+                    text: $viewModel.content,
+                    viewModel: viewModel,
+                    font: NSFont(name: "Menlo", size: 14.0)
+                )
                     .padding(.top, 10)
                     .padding(.bottom, 10)
                     .padding(.leading, 0)
                     .padding(.trailing, 10)
-                    .frame(height: 160)
-                    .onChange(of: viewModel.content) { newValue in
-                        handleAutocomplete(oldValue: previousContent, newValue: newValue)
-                        previousContent = newValue
-                    }
+                    .frame(height: textAreaHeight)
             }
             .background(Color(NSColor.textBackgroundColor))
 
             if viewModel.fileURLs.count > 0 {
                 Divider()
                 mediaTray()
-                    /* TODO: this part conflicts with clickable media items */
-                    /*
-                    .focusable()
-                    .onPasteCommand(
-                        of: [.fileURL, .image, .movie],
-                        perform: QuickPostViewModel.shared.processPasteItems(_:)
-                    )
-                    */
             }
 
             if let audioURL = viewModel.audioURL {
@@ -112,9 +110,12 @@ struct QuickPostView: View {
                 }
                 Spacer()
                 Button(role: .cancel) {
-                    viewModel.fileURLs = []
-                    viewModel.content = ""
-                    dismiss()
+                    if viewModel.hasContent {
+                        viewModel.showDiscardAlert = true
+                    } else {
+                        viewModel.cleanup()
+                        dismiss()
+                    }
                 } label: {
                     Text("Cancel")
                         .frame(minWidth: 50)
@@ -142,62 +143,25 @@ struct QuickPostView: View {
             }.padding(10)
                 .background(Color(NSColor.windowBackgroundColor))
         }.frame(width: 500, height: sheetHeight())
+        .alert("Discard Post?", isPresented: $viewModel.showDiscardAlert) {
+            Button("Discard", role: .destructive) {
+                viewModel.cleanup()
+                dismiss()
+            }
+            Button("Keep Editing", role: .cancel) {}
+        } message: {
+            Text("Your post will be lost if you discard it.")
+        }
     }
 
     private func sheetHeight() -> CGFloat {
         if viewModel.fileURLs.count > 0 {
             if let _ = viewModel.audioURL {
-                return 310 + 25
+                return textAreaHeight + 175
             }
-            return 310
+            return textAreaHeight + 150
         }
-        return 200
-    }
-
-    private func handleAutocomplete(oldValue: String, newValue: String) {
-        // Only process if content increased (user added text, not deleted)
-        guard newValue.count > oldValue.count else { return }
-
-        // Check if the last added character(s) include a newline
-        let addedText = String(newValue.suffix(newValue.count - oldValue.count))
-        guard addedText.contains("\n") else { return }
-
-        // Split into lines
-        let lines = newValue.components(separatedBy: "\n")
-        guard lines.count >= 2 else { return }
-
-        // Get the previous line (the one before the newly added line)
-        let previousLine = lines[lines.count - 2]
-        let trimmedPrevious = previousLine.trimmingCharacters(in: .whitespaces)
-
-        // Check if previous line is an empty list item (including todo lists)
-        if trimmedPrevious == "*" || trimmedPrevious == "-" || trimmedPrevious == "- [ ]" || trimmedPrevious == "- [x]" {
-            // Remove the empty list marker from previous line
-            var updatedLines = lines
-            updatedLines[lines.count - 2] = ""
-            viewModel.content = updatedLines.joined(separator: "\n")
-            return
-        }
-
-        // Check if previous line starts with todo list markers
-        if trimmedPrevious.hasPrefix("- [ ] ") || trimmedPrevious.hasPrefix("- [x] ") {
-            // Add "- [ ] " to the new line
-            if newValue.hasSuffix("\n") {
-                viewModel.content = newValue + "- [ ] "
-            }
-        }
-        // Check if previous line starts with list markers
-        else if trimmedPrevious.hasPrefix("* ") {
-            // Add "* " to the new line if not already there
-            if newValue.hasSuffix("\n") {
-                viewModel.content = newValue + "* "
-            }
-        } else if trimmedPrevious.hasPrefix("- ") {
-            // Add "- " to the new line if not already there
-            if newValue.hasSuffix("\n") {
-                viewModel.content = newValue + "- "
-            }
-        }
+        return textAreaHeight + 40
     }
 
     @ViewBuilder
@@ -247,14 +211,7 @@ struct QuickPostView: View {
         }
         .contextMenu {
             Button {
-                viewModel.fileURLs.removeAll { $0 == url }
-                if let audioURL = viewModel.audioURL, audioURL == url {
-                    viewModel.audioURL = nil
-                }
-                // Also remove the media reference from the content
-                let currentContent = viewModel.content
-                let mediaReference = url.htmlCode
-                viewModel.content = currentContent.replacingOccurrences(of: mediaReference, with: "")
+                viewModel.removeFile(url)
             } label: {
                 Label("Remove", systemImage: "trash")
             }
@@ -297,56 +254,20 @@ struct QuickPostView: View {
 
     private func attach(_ type: AttachmentType = .file) throws {
         let panel = NSOpenPanel()
-        panel.message = "Add Attachments"
-        panel.prompt = "Add"
+        panel.message = L10n("Add Attachments")
+        panel.prompt = L10n("Add")
         panel.allowedContentTypes = viewModel.allowedContentTypes
         panel.allowsMultipleSelection = viewModel.allowMultipleSelection
         panel.canChooseDirectories = false
         panel.showsHiddenFiles = false
         let response = panel.runModal()
         guard response == .OK, panel.urls.count > 0 else { return }
-        let urls = panel.urls
-        urls.forEach { url in
-            if type == .image {
-                if url.lastPathComponent.hasSuffix(".heic") {
-                    // Convert HEIC to JPEG
-                    if let heicData = try? Data(contentsOf: url), let image = NSImage(data: heicData) {
-                        let jpegData = image.JPEGData
-                        let tempDir = FileManager.default.temporaryDirectory
-                        let jpegURL = tempDir.appendingPathComponent(UUID().uuidString).appendingPathExtension("jpg")
-                        if let jpegData = jpegData, let _ = try? jpegData.write(to: jpegURL) {
-                            viewModel.fileURLs.append(jpegURL)
-                        } else {
-                            viewModel.fileURLs.append(url)
-                        }
-                    } else {
-                        viewModel.fileURLs.append(url)
-                    }
-                }
-                else {
-                    viewModel.fileURLs.append(url)
-                }
-            } else {
-                viewModel.fileURLs.append(url)
-            }
-            if type == .audio {
-                if let existingAudioURL = viewModel.audioURL {
-                    viewModel.fileURLs.removeAll { $0 == existingAudioURL }
-                }
-                viewModel.audioURL = url
-            }
-            if type == .video {
-                viewModel.videoURL = url
-            }
-        }
+        try viewModel.addFilesFromOpenPanel(panel.urls, type: type)
     }
 
     private func saveContent() throws {
         defer {
-            viewModel.fileURLs = []
-            viewModel.content = ""
-            viewModel.audioURL = nil
-            viewModel.audioURL = nil
+            viewModel.cleanup()
         }
         // Save content as a new MyArticleModel
         guard let planet = KeyboardShortcutHelper.shared.activeMyPlanet else { return }
@@ -389,12 +310,23 @@ struct QuickPostView: View {
 
         do {
             try article.save()
-            try article.savePublic()
+            try article.savePublicMinimal()
             try planet.copyTemplateAssets()
             planet.updated = Date()
             try planet.save()
 
+            // Heavy work (CIDs, cover images, hero grids, etc.) + publish in background
             Task(priority: .userInitiated) {
+                do {
+                    try article.savePublicDeferred()
+                } catch {
+                    Task { @MainActor in
+                        PlanetStore.shared.isShowingAlert = true
+                        PlanetStore.shared.alertTitle = L10n("Failed to Prepare Article for Publishing")
+                        PlanetStore.shared.alertMessage = error.localizedDescription
+                    }
+                    return
+                }
                 try await planet.savePublic()
                 try await planet.publish()
                 Task(priority: .background) {
@@ -402,41 +334,31 @@ struct QuickPostView: View {
                 }
             }
 
+            // UI update: set list + selection directly to avoid nil-selection flash.
+            // Don't call refreshSelectedArticles() — it sets selectedArticle = nil
+            // causing WebView to load noSelectionURL. planet.articles already includes
+            // the new article from the append above.
             Task { @MainActor in
-                PlanetStore.shared.selectedView = .myPlanet(planet)
-                PlanetStore.shared.refreshSelectedArticles()
-                // wrap it to delay the state change
+                let store = PlanetStore.shared
+                store.selectedView = .myPlanet(planet)
+                store.selectedArticleList = planet.articles
+                store.navigationTitle = planet.name
+                store.navigationSubtitle = planet.navigationSubtitle()
+
                 if planet.templateName == "Croptop" {
-                    Task { @MainActor in
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                            // Croptop needs a delay here when it loads from the local gateway
-                            if PlanetStore.shared.selectedArticle == article {
-                                NotificationCenter.default.post(name: .loadArticle, object: nil)
-                            }
-                            else {
-                                PlanetStore.shared.selectedArticle = article
-                            }
-                            Task(priority: .userInitiated) {
-                                NotificationCenter.default.post(
-                                    name: .scrollToArticle,
-                                    object: article
-                                )
-                            }
-                        }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        store.selectedArticle = article
+                        NotificationCenter.default.post(
+                            name: .scrollToArticle,
+                            object: article
+                        )
                     }
-                }
-                else {
-                    Task { @MainActor in
-                        if PlanetStore.shared.selectedArticle == article {
-                            NotificationCenter.default.post(name: .loadArticle, object: nil)
-                        }
-                        else {
-                            PlanetStore.shared.selectedArticle = article
-                        }
-                        Task(priority: .userInitiated) {
-                            NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                        }
-                    }
+                } else {
+                    store.selectedArticle = article
+                    NotificationCenter.default.post(
+                        name: .scrollToArticle,
+                        object: article
+                    )
                 }
             }
         }
@@ -444,6 +366,209 @@ struct QuickPostView: View {
             debugPrint("Failed to save quick post")
         }
     }
+}
+
+struct QuickPostTextView: NSViewRepresentable {
+    @Binding var text: String
+    @ObservedObject var viewModel: QuickPostViewModel
+    var font: NSFont? = NSFont(name: "Menlo", size: 14)
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> QuickPostTextEditorContainer {
+        let textView = QuickPostTextEditorContainer(text: text, viewModel: viewModel, font: font)
+        textView.delegate = context.coordinator
+        return textView
+    }
+
+    func updateNSView(_ nsView: QuickPostTextEditorContainer, context: Context) {
+        nsView.updateText(text)
+    }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: QuickPostTextView
+
+        init(_ parent: QuickPostTextView) {
+            self.parent = parent
+        }
+
+        func textDidBeginEditing(_ notification: Notification) {
+            guard let textView = notification.object as? QuickPostEditorTextView else {
+                return
+            }
+            // Skip binding update during IME composition to avoid destroying marked text
+            guard !textView.hasMarkedText() else { return }
+            parent.text = textView.string
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? QuickPostEditorTextView else {
+                return
+            }
+            // During IME composition (marked text), only update content height
+            // but do NOT push text back to the binding — that triggers updateNSView
+            // which calls textView.string = text, destroying the composing session
+            if textView.hasMarkedText() {
+                updateContentHeight(textView)
+                return
+            }
+            parent.text = textView.string
+            updateContentHeight(textView)
+        }
+
+        private func updateContentHeight(_ textView: NSTextView) {
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else { return }
+            layoutManager.ensureLayout(for: textContainer)
+            let usedRect = layoutManager.usedRect(for: textContainer)
+            let height = usedRect.height + textView.textContainerInset.height * 2
+            DispatchQueue.main.async {
+                self.parent.viewModel.textContentHeight = height
+            }
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            guard let textView = notification.object as? QuickPostEditorTextView else {
+                return
+            }
+            parent.text = textView.string
+        }
+    }
+}
+
+final class QuickPostTextEditorContainer: NSView {
+    private lazy var scrollView: NSScrollView = {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = true
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalRuler = false
+        scrollView.autoresizingMask = [.width, .height]
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        return scrollView
+    }()
+
+    private lazy var textView: QuickPostEditorTextView = {
+        let contentSize = scrollView.contentSize
+        let textStorage = NSTextStorage()
+
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+
+        let textContainer = NSTextContainer(containerSize: scrollView.frame.size)
+        textContainer.widthTracksTextView = true
+        textContainer.containerSize = NSSize(
+            width: contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+
+        layoutManager.addTextContainer(textContainer)
+
+        let textView = QuickPostEditorTextView(
+            viewModel: viewModel,
+            frame: .zero,
+            textContainer: textContainer
+        )
+        textView.autoresizingMask = .width
+        textView.textContainerInset = NSSize(width: 4, height: 4)
+        textView.backgroundColor = NSColor.clear
+        textView.drawsBackground = true
+        textView.font = font
+        textView.string = text
+        textView.isEditable = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.minSize = NSSize(width: 0, height: contentSize.height)
+        textView.textColor = NSColor.labelColor
+        textView.isRichText = false
+        textView.usesFontPanel = false
+        textView.allowsUndo = true
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineSpacing = 4
+        textView.defaultParagraphStyle = paragraphStyle
+        textView.typingAttributes[.paragraphStyle] = paragraphStyle
+        return textView
+    }()
+
+    private let viewModel: QuickPostViewModel
+    private let font: NSFont?
+    private var text: String
+    unowned var delegate: NSTextViewDelegate?
+
+    init(text: String, viewModel: QuickPostViewModel, font: NSFont?) {
+        self.text = text
+        self.viewModel = viewModel
+        self.font = font
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("QuickPostTextEditorContainer: required init?(coder:) not implemented")
+    }
+
+    override func viewWillDraw() {
+        super.viewWillDraw()
+        guard scrollView.superview == nil else { return }
+        addSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor)
+        ])
+        textView.delegate = delegate
+        scrollView.documentView = textView
+    }
+
+    func updateText(_ text: String) {
+        self.text = text
+        // Never overwrite the text view while the IME is composing (marked text active)
+        // — doing so destroys the composing session and causes garbled input
+        guard !textView.hasMarkedText() else { return }
+        guard textView.string != text else { return }
+        textView.string = text
+        let end = (text as NSString).length
+        textView.setSelectedRange(NSRange(location: end, length: 0))
+        updateContentHeight()
+    }
+
+    private func updateContentHeight() {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer)
+        let height = usedRect.height + textView.textContainerInset.height * 2
+        DispatchQueue.main.async { [weak self] in
+            self?.viewModel.textContentHeight = height
+        }
+    }
+}
+
+final class QuickPostEditorTextView: MarkdownEditorTextView {
+    @ObservedObject private var viewModel: QuickPostViewModel
+
+    init(viewModel: QuickPostViewModel, frame: NSRect, textContainer: NSTextContainer?) {
+        self.viewModel = viewModel
+        super.init(frame: frame, textContainer: textContainer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("QuickPostEditorTextView: required init?(coder:) not implemented")
+    }
+
+    override func paste(_ sender: Any?) {
+        if viewModel.processMediaPasteIfAvailable() {
+            return
+        }
+        super.paste(sender)
+    }
+
 }
 
 #Preview {

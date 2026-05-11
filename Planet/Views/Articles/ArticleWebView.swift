@@ -6,6 +6,7 @@ struct ArticleWebView: NSViewRepresentable {
     static let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "ArticleWebView")
 
     @Binding var url: URL
+    @Binding var themeColor: NSColor?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -18,89 +19,158 @@ struct ArticleWebView: NSViewRepresentable {
 
         wv.navigationDelegate = context.coordinator
         wv.setValue(false, forKey: "drawsBackground")
-        if url.isFileURL {
-            wv.loadFileURL(
-                url,
-                allowingReadAccessTo: url.deletingLastPathComponent().deletingLastPathComponent()
-            )
-        }
-        else {
-            wv.load(URLRequest(url: url))
-        }
-
-        // TODO: How to ensure it's refreshed?
-        NotificationCenter.default.addObserver(forName: .loadArticle, object: nil, queue: .main) {
-            _ in
-            Self.logger.log("Loading \(url), user agent: \(wv.customUserAgent ?? "")")
-            if url.isFileURL {
-                wv.loadFileURL(
-                    url,
-                    allowingReadAccessTo: url.deletingLastPathComponent()
-                        .deletingLastPathComponent()
-                )
-            }
-            else {
-                wv.load(URLRequest(url: url))
-            }
-        }
-
-        NotificationCenter.default.addObserver(
-            forName: .downloadArticleAttachment,
-            object: nil,
-            queue: nil
-        ) { n in
-            Self.logger.log("Downloading \(url)")
-            guard let url = n.object as? URL else { return }
-            wv.load(URLRequest(url: url))
-        }
-
-        NotificationCenter.default.addObserver(forName: .updateRuleList, object: nil, queue: nil) { n in
-            guard let port = n.object as? NSNumber else { return }
-            Self.logger.log("Updating rule list for api port \(port.intValue)")
-            let ruleListString = """
-                [
-                    {
-                        "trigger": {
-                            "url-filter": "://127.0.0.1:\(port.intValue)/*"
-                        },
-                        "action": {
-                            "type": "block"
-                        }
-                    },
-                    {
-                        "trigger": {
-                            "url-filter": "://localhost:\(port.intValue)/*"
-                        },
-                        "action": {
-                            "type": "block"
-                        }
-                    }
-                ]
-            """
-            Task {
-                do {
-                    if let contentList: WKContentRuleList = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "IPFSAPIPortList", encodedContentRuleList: ruleListString) {
-                        await wv.configuration.userContentController.add(contentList)
-                    }
-                } catch {
-                    debugPrint("failed to update rule list for article view: \(error)")
-                }
-            }
-        }
+        context.coordinator.attach(to: wv)
+        context.coordinator.loadCurrentURL(forceReload: true)
 
         return wv
     }
 
     func updateNSView(_ nsView: PlanetDownloadsWebView, context: Context) {
+        context.coordinator.parent = self
+        context.coordinator.attach(to: nsView)
+        context.coordinator.loadCurrentURL(forceReload: false)
     }
 
     class Coordinator: NSObject, WKNavigationDelegate, WKDownloadDelegate {
-        let parent: ArticleWebView
+        var parent: ArticleWebView
+        weak var webView: PlanetDownloadsWebView?
+        private var observerTokens: [NSObjectProtocol] = []
+        private var lastLoadedURL: URL?
 
         private var navigationType: WKNavigationType = .other
 
         init(_ parent: ArticleWebView) {
             self.parent = parent
+        }
+
+        deinit {
+            observerTokens.forEach(NotificationCenter.default.removeObserver)
+        }
+
+        func attach(to webView: PlanetDownloadsWebView) {
+            self.webView = webView
+            guard observerTokens.isEmpty else {
+                return
+            }
+
+            observerTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .loadArticle,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.loadCurrentURL(forceReload: true)
+                }
+            )
+
+            observerTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .readerFontSizeChanged,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    guard let webView = self?.webView,
+                        let fontSize = notification.object as? NSNumber
+                    else {
+                        return
+                    }
+                    webView.evaluateJavaScript(
+                        "document.body.style.fontSize = '\(fontSize.intValue)px';"
+                    )
+                }
+            )
+
+            observerTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .downloadArticleAttachment,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    guard let webView = self?.webView,
+                        let url = notification.object as? URL
+                    else {
+                        return
+                    }
+                    ArticleWebView.logger.log(
+                        "Downloading attachment \(url.absoluteString, privacy: .public)"
+                    )
+                    webView.load(URLRequest(url: url))
+                }
+            )
+
+            observerTokens.append(
+                NotificationCenter.default.addObserver(
+                    forName: .updateRuleList,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] notification in
+                    guard let webView = self?.webView,
+                        let port = notification.object as? NSNumber
+                    else {
+                        return
+                    }
+                    ArticleWebView.logger.log("Updating rule list for api port \(port.intValue)")
+                    let ruleListString = """
+                        [
+                            {
+                                "trigger": {
+                                    "url-filter": "://127.0.0.1:\(port.intValue)/*"
+                                },
+                                "action": {
+                                    "type": "block"
+                                }
+                            },
+                            {
+                                "trigger": {
+                                    "url-filter": "://localhost:\(port.intValue)/*"
+                                },
+                                "action": {
+                                    "type": "block"
+                                }
+                            }
+                        ]
+                    """
+                    Task {
+                        do {
+                            if let contentList = try await WKContentRuleListStore.default()
+                                .compileContentRuleList(
+                                    forIdentifier: "IPFSAPIPortList",
+                                    encodedContentRuleList: ruleListString
+                                )
+                            {
+                                await webView.configuration.userContentController.add(contentList)
+                            }
+                        } catch {
+                            debugPrint("failed to update rule list for article view: \(error)")
+                        }
+                    }
+                }
+            )
+        }
+
+        func loadCurrentURL(forceReload: Bool) {
+            load(parent.url, forceReload: forceReload)
+        }
+
+        private func load(_ url: URL, forceReload: Bool) {
+            guard let webView else {
+                return
+            }
+            guard forceReload || lastLoadedURL != url else {
+                return
+            }
+
+            ArticleWebView.logger.log("Loading article url \(url.absoluteString, privacy: .public)")
+            if url.isFileURL {
+                webView.loadFileURL(url, allowingReadAccessTo: readAccessURL(for: url))
+            } else {
+                webView.load(URLRequest(url: url))
+            }
+            lastLoadedURL = url
+        }
+
+        private func readAccessURL(for url: URL) -> URL {
+            url.deletingLastPathComponent().deletingLastPathComponent()
         }
 
         private func shouldHandleDownloadForMIMEType(_ mimeType: String) -> Bool {
@@ -126,6 +196,45 @@ struct ArticleWebView: NSViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             debugPrint("ArticleWebView: didFinish \(String(describing: navigation))")
+            #if DEBUG
+            ThemeColorExtractor.debugLog("didFinish: url=\(webView.url?.lastPathComponent ?? "nil") themeColor=\(String(describing: parent.themeColor))")
+            #endif
+            extractThemeColorIfNeeded(from: webView)
+        }
+
+        private func extractThemeColorIfNeeded(from webView: WKWebView) {
+            guard let currentURL = webView.url, !currentURL.isFileURL else { return }
+            // First try <meta name="theme-color">, then fall back to the page's
+            // computed body background color (catches sites like daringfireball.net
+            // that style their background via CSS but have no theme-color meta tag).
+            let js = """
+            (function() {
+                var isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                var darkMeta = document.querySelector('meta[name="theme-color"][media*="dark"]');
+                if (isDark && darkMeta) return darkMeta.content;
+                var lightMeta = document.querySelector('meta[name="theme-color"][media*="light"]');
+                if (!isDark && lightMeta) return lightMeta.content;
+                var generic = document.querySelector('meta[name="theme-color"]:not([media])') || document.querySelector('meta[name="theme-color"]');
+                if (generic) return generic.content;
+                var bodyBg = window.getComputedStyle(document.body).backgroundColor;
+                if (bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' && bodyBg !== 'transparent') return bodyBg;
+                return null;
+            })()
+            """
+            webView.evaluateJavaScript(js) { [weak self] result, _ in
+                guard let self = self else { return }
+                let color: NSColor?
+                if let colorString = result as? String {
+                    color = ThemeColorExtractor.parseColor(colorString)
+                } else {
+                    color = nil
+                }
+                DispatchQueue.main.async {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        self.parent.themeColor = color
+                    }
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!)

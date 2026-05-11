@@ -3,6 +3,15 @@ import SwiftUI
 struct MyPlanetEditView: View {
     let CONTROL_CAPTION_WIDTH: CGFloat = 120
     let SOCIAL_CONTROL_CAPTION_WIDTH: CGFloat = 120
+    let MESSAGE_SLUG_REQUIREMENT =
+        "The slug should contain only letters, numbers, and hyphens."
+
+    private enum CloudflareTokenStatus: Equatable {
+        case idle
+        case checking
+        case verified
+        case invalid
+    }
 
     @Environment(\.dismiss) var dismiss
 
@@ -16,10 +25,23 @@ struct MyPlanetEditView: View {
     @State private var about: String
     @State private var domain: String
     @State private var authorName: String
+    @State private var slug: String
     @State private var templateName: String
     @State private var saveRoundAvatar: Bool = false
     @State private var doNotIndex: Bool = false
     @State private var prewarmNewPost: Bool = true
+    @State private var publishAsIPNS: Bool = true
+    @State private var sshRsyncEnabled: Bool = false
+    @State private var sshRsyncDestination: String
+    @State private var sshRsyncKeyPath: String?
+    @State private var sshRsyncDeleteEnabled: Bool = false
+
+    @State private var cloudflarePagesEnabled: Bool = false
+    @State private var cloudflarePagesAccountID: String
+    @State private var cloudflarePagesAPIToken: String
+    @State private var cloudflarePagesProjectName: String
+    @State private var cloudflareTokenStatus: CloudflareTokenStatus = .idle
+    @State private var cloudflareTokenCheckTask: Task<Void, Never>? = nil
 
     @State private var plausibleEnabled: Bool = false
     @State private var plausibleDomain: String
@@ -42,10 +64,6 @@ struct MyPlanetEditView: View {
     @State private var juiceboxProjectID: String
     /* @State private var juiceboxProjectIDGoerli: String */
 
-    @State private var farcasterEnabled: Bool = false
-    @State private var farcasterUsername: String
-    @State private var farcasterJSON: String
-
     @State private var pinnableEnabled: Bool = false
     @State private var pinnableAPIEndpoint: String
     @State private var pinnablePinCID: String? = nil
@@ -65,6 +83,45 @@ struct MyPlanetEditView: View {
 
     // Highlight Color (Currently only for Croptop)
     @State private var selectedColor: Color = Color(hex: "#F056C1")
+    @State private var avatarChanged = false
+
+    private struct EditSnapshot: Equatable {
+        let name: String
+        let about: String
+        let domain: String?
+        let authorName: String?
+        let slug: String?
+        let templateName: String
+        let saveRoundAvatar: Bool
+        let doNotIndex: Bool
+        let prewarmNewPost: Bool
+        let publishAsIPNS: Bool
+        let sshRsyncEnabled: Bool
+        let sshRsyncDestination: String?
+        let sshRsyncKeyPath: String?
+        let sshRsyncDeleteEnabled: Bool
+        let cloudflarePagesEnabled: Bool
+        let cloudflarePagesAccountID: String?
+        let cloudflarePagesAPIToken: String?
+        let cloudflarePagesProjectName: String?
+        let plausibleEnabled: Bool
+        let plausibleDomain: String?
+        let plausibleAPIKey: String?
+        let plausibleAPIServer: String
+        let twitterUsername: String?
+        let githubUsername: String?
+        let telegramUsername: String?
+        let mastodonUsername: String?
+        let discordLink: String?
+        let juiceboxEnabled: Bool
+        let juiceboxProjectID: Int?
+        let pinnableEnabled: Bool
+        let pinnableAPIEndpoint: String?
+        let filebaseEnabled: Bool
+        let filebasePinName: String?
+        let filebaseAPIToken: String?
+        let templateSettings: [String: String]
+    }
 
     init(planet: MyPlanetModel) {
         self.planet = planet
@@ -72,10 +129,20 @@ struct MyPlanetEditView: View {
         _about = State(wrappedValue: planet.about)
         _domain = State(wrappedValue: planet.domain ?? "")
         _authorName = State(wrappedValue: planet.authorName ?? "")
+        _slug = State(wrappedValue: planet.slug ?? "")
         _templateName = State(wrappedValue: planet.templateName)
         _saveRoundAvatar = State(wrappedValue: planet.saveRoundAvatar ?? false)
         _doNotIndex = State(wrappedValue: planet.doNotIndex ?? false)
         _prewarmNewPost = State(wrappedValue: planet.prewarmNewPost ?? true)
+        _publishAsIPNS = State(wrappedValue: planet.publishAsIPNS ?? true)
+        _sshRsyncEnabled = State(wrappedValue: planet.sshRsyncEnabled ?? false)
+        _sshRsyncDestination = State(wrappedValue: planet.sshRsyncDestination ?? "")
+        _sshRsyncKeyPath = State(wrappedValue: planet.sshRsyncKeyPath)
+        _sshRsyncDeleteEnabled = State(wrappedValue: planet.sshRsyncDeleteEnabled ?? false)
+        _cloudflarePagesEnabled = State(wrappedValue: planet.cloudflarePagesEnabled ?? false)
+        _cloudflarePagesAccountID = State(wrappedValue: planet.cloudflarePagesAccountID ?? "")
+        _cloudflarePagesAPIToken = State(wrappedValue: planet.cloudflarePagesAPIToken ?? "")
+        _cloudflarePagesProjectName = State(wrappedValue: planet.cloudflarePagesProjectName ?? "")
         _plausibleEnabled = State(wrappedValue: planet.plausibleEnabled ?? false)
         _plausibleDomain = State(wrappedValue: planet.plausibleDomain ?? "")
         _plausibleAPIKey = State(wrappedValue: planet.plausibleAPIKey ?? "")
@@ -97,15 +164,264 @@ struct MyPlanetEditView: View {
             wrappedValue: planet.juiceboxProjectIDGoerli?.stringValue() ?? ""
         )
         */
-        _farcasterEnabled = State(wrappedValue: planet.farcasterEnabled ?? false)
-        _farcasterUsername = State(wrappedValue: planet.farcasterUsername ?? "")
-        _farcasterJSON = State(wrappedValue: planet.farcasterJSON ?? "")
         _pinnableEnabled = State(wrappedValue: planet.pinnableEnabled ?? false)
         _pinnableAPIEndpoint = State(wrappedValue: planet.pinnableAPIEndpoint ?? "")
         _pinnablePinCID = State(wrappedValue: planet.pinnablePinCID ?? nil)
         _filebaseEnabled = State(wrappedValue: planet.filebaseEnabled ?? false)
         _filebasePinName = State(wrappedValue: planet.filebasePinName ?? "")
         _filebaseAPIToken = State(wrappedValue: planet.filebaseAPIToken ?? "")
+    }
+
+    @ViewBuilder
+    private func publishingLinkRow(title: String, value: String, url: URL?) -> some View {
+        let rowContent = HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
+            Text(title)
+                .font(.system(size: 12, weight: .bold))
+                .frame(width: CONTROL_CAPTION_WIDTH, alignment: .leading)
+
+            Text(value)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(url == nil ? .secondary : .primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer()
+
+            if url != nil {
+                Image(systemName: "arrow.up.right.square")
+                    .foregroundColor(.secondary)
+            }
+        }
+        .contentShape(Rectangle())
+
+        if let url {
+            Button {
+                NSWorkspace.shared.open(url)
+            } label: {
+                rowContent
+            }
+            .buttonStyle(.plain)
+        }
+        else {
+            rowContent
+        }
+    }
+
+    private func helpRow(
+        _ text: Text,
+        leftOffset: CGFloat? = nil,
+        lineLimit: Int = 3
+    ) -> some View {
+        HStack {
+            HStack {
+                Spacer()
+            }
+            .frame(width: leftOffset ?? CONTROL_CAPTION_WIDTH + 10)
+
+            text.lineLimit(lineLimit)
+                .font(.footnote)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private func publishingTab() -> some View {
+        VStack(spacing: PlanetUI.CONTROL_ROW_SPACING) {
+            HStack {
+                HStack {
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH + 10)
+
+                Toggle("Publish as IPNS", isOn: $publishAsIPNS)
+                    .toggleStyle(.checkbox)
+                    .frame(alignment: .leading)
+
+                Spacer()
+            }
+
+            helpRow(
+                Text("When disabled, publish actions skip IPFS work and leave any existing IPNS or CID unchanged.")
+            )
+
+            publishingLinkRow(
+                title: "IPNS",
+                value: planet.ipns,
+                url: IPFSDaemon.urlForIPNS(planet.ipns)
+            )
+
+            publishingLinkRow(
+                title: "CID",
+                value: planet.lastPublishedCID ?? "Not published yet",
+                url: planet.lastPublishedCID.flatMap { IPFSDaemon.urlForCID($0) }
+            )
+
+            Divider()
+                .padding(.top, 6)
+                .padding(.bottom, 6)
+
+            HStack {
+                HStack {
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH + 10)
+
+                Toggle("Publish via SSH rsync", isOn: $sshRsyncEnabled)
+                    .toggleStyle(.checkbox)
+                    .frame(alignment: .leading)
+
+                Spacer()
+            }
+
+            HStack {
+                HStack {
+                    Text("Address")
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH)
+
+                TextField(
+                    "",
+                    text: $sshRsyncDestination,
+                    prompt: Text("user@example.com:/www/example")
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                HStack {
+                    Text("SSH Key")
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH)
+
+                Text(sshRsyncKeyPath ?? "None (using ssh-agent)")
+                    .foregroundColor(sshRsyncKeyPath != nil ? .primary : .secondary)
+                    .font(.system(size: 12, design: .monospaced))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Spacer()
+
+                if sshRsyncKeyPath != nil {
+                    Button("Clear") {
+                        sshRsyncKeyPath = nil
+                        try? FileManager.default.removeItem(at: planet.sshRsyncKeyStorePath)
+                    }
+                }
+
+                Button("Select") {
+                    selectSSHKey()
+                }
+            }
+
+            helpRow(
+                Text("Select a private key if ssh-agent is not available.")
+            )
+
+            HStack {
+                HStack {
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH + 10)
+
+                Toggle("Delete extraneous files on destination", isOn: $sshRsyncDeleteEnabled)
+                    .toggleStyle(.checkbox)
+                    .frame(alignment: .leading)
+
+                Spacer()
+            }
+
+            helpRow(
+                Text("When enabled, files on the destination that are not in the source will be removed.")
+            )
+
+            Divider()
+                .padding(.top, 6)
+                .padding(.bottom, 6)
+
+            HStack {
+                HStack {
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH + 10)
+
+                Toggle("Publish via Cloudflare Pages", isOn: $cloudflarePagesEnabled)
+                    .toggleStyle(.checkbox)
+                    .frame(alignment: .leading)
+
+                Spacer()
+            }
+
+            HStack {
+                HStack {
+                    Text("Account ID")
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH)
+
+                TextField(
+                    "",
+                    text: $cloudflarePagesAccountID,
+                    prompt: Text("Cloudflare Account ID")
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                HStack(spacing: 6) {
+                    Text("API Token")
+                    if let indicatorState = cloudflareTokenIndicatorState {
+                        StatusIndicatorView(state: indicatorState)
+                    }
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH)
+
+                SecureField(
+                    "",
+                    text: $cloudflarePagesAPIToken,
+                    prompt: Text("Cloudflare API Token")
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                HStack {
+                    Text("Project Name")
+                    Spacer()
+                }
+                .frame(width: CONTROL_CAPTION_WIDTH)
+
+                TextField(
+                    "",
+                    text: $cloudflarePagesProjectName,
+                    prompt: Text("my-site")
+                )
+                .textFieldStyle(.roundedBorder)
+            }
+
+            helpRow(
+                Text("The project will be created automatically if it doesn't exist. Use an API token with Cloudflare Pages Edit permission.")
+            )
+
+            if let urlString = planet.cloudflarePagesLastDeployedURL,
+               let url = URL(string: urlString) {
+                publishingLinkRow(
+                    title: "Pages URL",
+                    value: url.absoluteString,
+                    url: url
+                )
+            }
+        }
+        .padding(16)
+        .tabItem {
+            Text("Publishing")
+        }
+        .tag("publishing")
     }
 
     @ViewBuilder
@@ -170,6 +486,11 @@ struct MyPlanetEditView: View {
         VStack(spacing: PlanetUI.CONTROL_ROW_SPACING) {
             HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
                 HStack {
+                    Image("custom.mastodon.fill")
+                        .renderingMode(.original)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16, alignment: .center)
                     Text("Mastodon")
                     Spacer()
                 }
@@ -181,6 +502,11 @@ struct MyPlanetEditView: View {
 
             HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
                 HStack {
+                    Image("custom.twitter")
+                        .renderingMode(.original)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16, alignment: .center)
                     Text("Twitter")
                     Spacer()
                 }
@@ -192,6 +518,10 @@ struct MyPlanetEditView: View {
 
             HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
                 HStack {
+                    Image("custom.github")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16, alignment: .center)
                     Text("GitHub")
                     Spacer()
                 }
@@ -203,6 +533,11 @@ struct MyPlanetEditView: View {
 
             HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
                 HStack {
+                    Image("custom.telegram")
+                        .renderingMode(.original)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16, alignment: .center)
                     Text("Telegram")
                     Spacer()
                 }
@@ -214,6 +549,11 @@ struct MyPlanetEditView: View {
 
             HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
                 HStack {
+                    Image("custom.discord")
+                        .renderingMode(.original)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 16, height: 16, alignment: .center)
                     Text("Discord Link")
                     Spacer()
                 }
@@ -221,6 +561,14 @@ struct MyPlanetEditView: View {
 
                 TextField("", text: $discordLink)
                     .textFieldStyle(.roundedBorder)
+            }
+
+            if PlanetStore.app == .planet {
+                Divider()
+                    .padding(.top, 6)
+                    .padding(.bottom, 6)
+
+                juiceboxView()
             }
         }
         .padding(16)
@@ -253,20 +601,11 @@ struct MyPlanetEditView: View {
                 .textFieldStyle(.roundedBorder)
         }
 
-        HStack {
-            HStack {
-                Spacer()
-            }
-            .frame(width: CONTROL_CAPTION_WIDTH + 20)
-
-            Text(
-                "You can get your API endpoint after you have added this site to [Pinnable](https://pinnable.xyz)."
-            )
-            .lineLimit(2)
-            .font(.footnote)
-            .foregroundColor(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
+        helpRow(
+            Text("You can get your API endpoint after you have added this site to [Pinnable](https://pinnable.xyz)."),
+            leftOffset: CONTROL_CAPTION_WIDTH + 20 + 10,
+            lineLimit: 2
+        )
 
         if let enabled = planet.pinnableEnabled, enabled {
             HStack {
@@ -463,87 +802,13 @@ struct MyPlanetEditView: View {
         }
     }
 
-    @ViewBuilder
-    private func farcasterView() -> some View {
-        HStack {
-            HStack {
-                Spacer()
-            }.frame(width: CONTROL_CAPTION_WIDTH + 40 + 10)
-            Toggle("Enable Farcaster Integration", isOn: $farcasterEnabled)
-                .toggleStyle(.checkbox)
-                .frame(alignment: .leading)
-            Spacer()
-            HelpLinkButton(
-                helpLink: URL(
-                    string: "https://www.planetable.xyz/guides/farcaster/"
-                )!
-            )
-        }
-
-        HStack {
-            HStack {
-                Image("custom.farcaster")
-                Text("Farcaster Username")
-                Spacer()
-            }
-            .frame(width: CONTROL_CAPTION_WIDTH + 40)
-
-            TextField("", text: $farcasterUsername)
-                .textFieldStyle(.roundedBorder)
-        }
-
-        HStack {
-            HStack {
-                Text("farcaster.json")
-                Spacer()
-            }
-            .frame(width: CONTROL_CAPTION_WIDTH + 40)
-
-            TextEditor(text: $farcasterJSON)
-                .font(.system(size: 13, weight: .regular, design: .monospaced))
-                .lineSpacing(2)
-                .disableAutocorrection(true)
-                .cornerRadius(6)
-                .frame(height: 120)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1.0)
-                )
-        }
-
-        HStack {
-            Spacer()
-
-            Button {
-                if let url = URL(string: "https://miniapps.farcaster.xyz/docs/guides/publishing") {
-                    NSWorkspace.shared.open(url)
-                }
-            } label: {
-                Image(systemName: "arrow.up.forward.app")
-                Text("Mini App Publishing Guide")
-            }
-
-            Button {
-                if let url = URL(string: "https://warpcast.com/~/developers/mini-apps/manifest") {
-                    NSWorkspace.shared.open(url)
-                }
-            } label: {
-                Image(systemName: "gear")
-                Text("Manifest Tool")
-            }
-        }
-
-        Divider()
-            .padding(.top, 6)
-            .padding(.bottom, 6)
-    }
 
     @ViewBuilder
     private func juiceboxView() -> some View {
-        HStack {
+        HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
             HStack {
                 Spacer()
-            }.frame(width: CONTROL_CAPTION_WIDTH + 40 + 10)
+            }.frame(width: SOCIAL_CONTROL_CAPTION_WIDTH)
             Toggle("Enable Juicebox Integration", isOn: $juiceboxEnabled)
                 .toggleStyle(.checkbox)
                 .frame(alignment: .leading)
@@ -555,13 +820,13 @@ struct MyPlanetEditView: View {
             )
         }
 
-        HStack {
+        HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
             HStack {
                 Image("custom.juicebox")
                 Text("Project ID")
                 Spacer()
             }
-            .frame(width: CONTROL_CAPTION_WIDTH + 40)
+            .frame(width: SOCIAL_CONTROL_CAPTION_WIDTH)
 
             TextField("", text: $juiceboxProjectID)
                 .textFieldStyle(.roundedBorder)
@@ -606,6 +871,7 @@ struct MyPlanetEditView: View {
                                 uploadAction: { url in
                                     do {
                                         try planet.updateAvatar(path: url)
+                                        avatarChanged = true
                                     }
                                     catch {
                                         debugPrint("failed to upload planet avatar: \(error)")
@@ -614,6 +880,7 @@ struct MyPlanetEditView: View {
                                 deleteAction: {
                                     do {
                                         try planet.removeAvatar()
+                                        avatarChanged = true
                                     }
                                     catch {
                                         debugPrint("failed to remove planet avatar: \(error)")
@@ -649,6 +916,19 @@ struct MyPlanetEditView: View {
 
                         HStack {
                             HStack {
+                                Text("Slug")
+                                Spacer()
+                            }
+                            .frame(width: CONTROL_CAPTION_WIDTH)
+
+                            TextField("", text: $slug, prompt: Text("my-site"))
+                                .textFieldStyle(.roundedBorder)
+                        }
+
+                        helpRow(Text(MESSAGE_SLUG_REQUIREMENT), lineLimit: 2)
+
+                        HStack {
+                            HStack {
                                 Text("Domain")
                                 Spacer()
                             }
@@ -658,20 +938,10 @@ struct MyPlanetEditView: View {
                                 .textFieldStyle(.roundedBorder)
                         }
 
-                        HStack {
-                            HStack {
-                                Spacer()
-                            }
-                            .frame(width: CONTROL_CAPTION_WIDTH + 10)
-
-                            Text(
-                                "This domain will be used in places that need a domain prefix, like for RSS or Podcast feeds."
-                            )
-                            .lineLimit(2)
-                            .font(.footnote)
-                            .foregroundColor(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        }
+                        helpRow(
+                            Text("This domain will be used in places that need a domain prefix, like for RSS or Podcast feeds."),
+                            lineLimit: 2
+                        )
 
                         HStack {
                             HStack {
@@ -718,19 +988,23 @@ struct MyPlanetEditView: View {
                         if PlanetStore.app == .planet
                             || ($templateName.wrappedValue != "Croptop" && PlanetStore.app == .lite)
                         {
-                            Picker(selection: $templateName) {
-                                ForEach(TemplateStore.shared.templates) { template in
-                                    Text(template.name)
-                                        .tag(template.name)
+                            HStack {
+                                Picker(selection: $templateName) {
+                                    ForEach(TemplateStore.shared.templates) { template in
+                                        Text(template.name)
+                                            .tag(template.name)
+                                    }
+                                } label: {
+                                    HStack {
+                                        Text("Template")
+                                        Spacer()
+                                    }
+                                    .frame(width: CONTROL_CAPTION_WIDTH)
                                 }
-                            } label: {
-                                HStack {
-                                    Text("Template")
-                                    Spacer()
-                                }
-                                .frame(width: CONTROL_CAPTION_WIDTH)
+                                .pickerStyle(.menu)
+
+                                Spacer()
                             }
-                            .pickerStyle(.menu)
                         }
 
                         if PlanetStore.app == .lite {
@@ -760,6 +1034,28 @@ struct MyPlanetEditView: View {
                                 .frame(alignment: .leading)
                             Spacer()
                         }
+
+                        HStack {
+                            HStack {
+                                Text("UUID")
+                                Spacer()
+                            }
+                            .frame(width: CONTROL_CAPTION_WIDTH)
+
+                            Text(planet.id.uuidString)
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+
+                            Spacer()
+
+                            Button {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(planet.id.uuidString, forType: .string)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                            }
+                            .help("Copy UUID to clipboard")
+                        }
                     }
                     .padding(16)
                     .tabItem {
@@ -768,6 +1064,8 @@ struct MyPlanetEditView: View {
                     .tag("basic")
 
                     analyticsTab()
+
+                    publishingTab()
 
                     if PlanetStore.app == .planet {
                         socialTab()
@@ -790,62 +1088,6 @@ struct MyPlanetEditView: View {
                     }
                     .tag("pinning")
 
-                    VStack(spacing: PlanetUI.CONTROL_ROW_SPACING) {
-                        farcasterView()
-                        if PlanetStore.app == .planet {
-                            juiceboxView()
-
-                            /*
-                            Divider()
-                                .padding(.top, 6)
-                                .padding(.bottom, 6)
-                            */
-                        }
-
-                        /*
-                        HStack {
-                            HStack {
-                                Spacer()
-                            }.frame(width: CONTROL_CAPTION_WIDTH + 20 + 10)
-                            Toggle("Enable dWebServices.xyz for IPNS", isOn: $dWebServicesEnabled)
-                                .toggleStyle(.checkbox)
-                                .frame(alignment: .leading)
-                            Spacer()
-                            HelpLinkButton(
-                                helpLink: URL(
-                                    string: "https://www.planetable.xyz/guides/dweb-services-xyz/"
-                                )!
-                            )
-                        }
-
-                        HStack {
-                            HStack {
-                                Text("Domain")
-                                Spacer()
-                            }
-                            .frame(width: CONTROL_CAPTION_WIDTH + 20)
-
-                            TextField("", text: $dWebServicesDomain)
-                                .textFieldStyle(.roundedBorder)
-                        }
-
-                        HStack {
-                            HStack {
-                                Text("API Key")
-                                Spacer()
-                            }
-                            .frame(width: CONTROL_CAPTION_WIDTH + 20)
-
-                            SecureField("", text: $dWebServicesAPIKey)
-                                .textFieldStyle(.roundedBorder)
-                        }
-                        */
-                    }
-                    .padding(16)
-                    .tabItem {
-                        Text("Integrations")
-                    }
-                    .tag("integrations")
                 }
 
                 HStack(spacing: PlanetUI.CONTROL_ITEM_GAP) {
@@ -863,85 +1105,28 @@ struct MyPlanetEditView: View {
                         if verifyUserInput() > 0 {
                             return
                         }
-                        if !name.trim().isEmpty {
-                            planet.name = name.trim()
+                        let snapshot = desiredSnapshot()
+                        let previousSnapshot = currentSnapshot()
+                        let hasChanges = avatarChanged || snapshot != previousSnapshot
+                        guard hasChanges else {
+                            dismiss()
+                            return
                         }
-                        var resaveAvatar = false
-                        planet.about = about.trim()
-                        planet.domain = domain.trim()
-                        if planet.authorName != authorName {
-                            if authorName == "" {
-                                planet.authorName = nil
-                            }
-                            else {
-                                planet.authorName = authorName.trim()
-                            }
-                        }
-                        planet.templateName = templateName
-                        if planet.saveRoundAvatar != saveRoundAvatar {
-                            planet.saveRoundAvatar = saveRoundAvatar
-                            if saveRoundAvatar {
-                                // Read the avatar file on disk and resave it
-                                if let _ = planet.avatar {
-                                    resaveAvatar = true
-                                }
-                            }
-                        }
-                        planet.doNotIndex = doNotIndex
-                        planet.plausibleEnabled = plausibleEnabled
-                        planet.plausibleDomain = plausibleDomain.trim()
-                        planet.plausibleAPIKey = plausibleAPIKey
-                        planet.plausibleAPIServer = plausibleAPIServer
-                        planet.twitterUsername = twitterUsername.sanitized().trim()
-                        planet.githubUsername = githubUsername.sanitized().trim()
-                        planet.telegramUsername = telegramUsername.sanitized().trim()
-                        planet.mastodonUsername = mastodonUsername.sanitized().trim()
-                        planet.discordLink = discordLink.trim()
-                        /*
-                        planet.dWebServicesEnabled = dWebServicesEnabled
-                        planet.dWebServicesDomain = dWebServicesDomain
-                        planet.dWebServicesAPIKey = dWebServicesAPIKey
-                        */
-                        planet.juiceboxEnabled = juiceboxEnabled
-                        planet.juiceboxProjectID = Int(juiceboxProjectID)
-                        /* planet.juiceboxProjectIDGoerli = Int(juiceboxProjectIDGoerli) */
-                        planet.farcasterEnabled = farcasterEnabled
-                        if farcasterUsername.count > 0 {
-                            planet.farcasterUsername = farcasterUsername
-                        }
-                        else {
-                            planet.farcasterUsername = nil
-                        }
-                        if farcasterJSON.count > 0 {
-                            planet.farcasterJSON = farcasterJSON
-                        }
-                        else {
-                            planet.farcasterJSON = nil
-                        }
-                        planet.pinnableEnabled = pinnableEnabled
-                        planet.pinnableAPIEndpoint = pinnableAPIEndpoint
-                        planet.filebaseEnabled = filebaseEnabled
-                        planet.filebasePinName = filebasePinName
-                        planet.filebaseAPIToken = filebaseAPIToken
+                        let planetNameChanged = snapshot.name != previousSnapshot.name
+                        let planetSlugChanged = snapshot.slug != previousSnapshot.slug
+                        let resaveAvatar =
+                            (planet.saveRoundAvatar ?? false) != snapshot.saveRoundAvatar
+                            && snapshot.saveRoundAvatar
+                            && planet.avatar != nil
+                        apply(snapshot)
                         Task {
-                            planet.updateTemplateSettings(settings: userSettings)
                             try planet.save()
-                            if farcasterEnabled, let fjson = planet.farcasterJSON, fjson.count > 0 {
-                                let wellKnown = planet.publicBasePath.appendingPathComponent(
-                                    ".well-known"
-                                )
-                                if !FileManager.default.fileExists(atPath: wellKnown.path) {
-                                    try? FileManager.default.createDirectory(
-                                        at: wellKnown,
-                                        withIntermediateDirectories: true
-                                    )
-                                }
-                                try? fjson.write(
-                                    to: planet.publicBasePath.appendingPathComponent(
-                                        ".well-known/farcaster.json"
-                                    ),
-                                    atomically: true,
-                                    encoding: .utf8
+                            if planetSlugChanged {
+                                try planet.articles.forEach { try $0.save() }
+                            }
+                            if planetNameChanged {
+                                _ = await PlanetStore.shared.reindexSpotlightItems(
+                                    forPlanetID: planet.id
                                 )
                             }
                             if resaveAvatar {
@@ -978,11 +1163,242 @@ struct MyPlanetEditView: View {
                     selectedColor = Color(hex: value)
                 }
             }
+            scheduleCloudflareTokenVerification()
+        }
+        .onChange(of: cloudflarePagesAPIToken) { _ in
+            scheduleCloudflareTokenVerification()
+        }
+        .onDisappear {
+            cloudflareTokenCheckTask?.cancel()
         }
     }
 }
 
 extension MyPlanetEditView {
+    private var cloudflareTokenIndicatorState: StatusIndicatorState? {
+        switch cloudflareTokenStatus {
+        case .checking:
+            .checking
+        case .verified:
+            .success
+        case .idle, .invalid:
+            nil
+        }
+    }
+
+    private func scheduleCloudflareTokenVerification() {
+        cloudflareTokenCheckTask?.cancel()
+
+        let token = cloudflarePagesAPIToken.trim()
+        guard !token.isEmpty else {
+            cloudflareTokenStatus = .idle
+            return
+        }
+
+        cloudflareTokenStatus = .checking
+        cloudflareTokenCheckTask = Task {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard !Task.isCancelled else { return }
+
+            let isVerified = await CloudflarePages.verifyAPIToken(token)
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                cloudflareTokenStatus = isVerified ? .verified : .invalid
+            }
+        }
+    }
+
+    private func normalizedOptionalString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trim()
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func normalizedSlug(_ value: String?) -> String? {
+        normalizedOptionalString(value)
+    }
+
+    private func normalizedSocialUsername(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.sanitized().trim()
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func normalizedPlausibleAPIServer(_ value: String?) -> String {
+        normalizedOptionalString(value) ?? "plausible.io"
+    }
+
+    private func currentSnapshot() -> EditSnapshot {
+        EditSnapshot(
+            name: planet.name.trim(),
+            about: planet.about.trim(),
+            domain: normalizedOptionalString(planet.domain),
+            authorName: normalizedOptionalString(planet.authorName),
+            slug: normalizedSlug(planet.slug),
+            templateName: planet.templateName,
+            saveRoundAvatar: planet.saveRoundAvatar ?? false,
+            doNotIndex: planet.doNotIndex ?? false,
+            prewarmNewPost: planet.prewarmNewPost ?? true,
+            publishAsIPNS: planet.publishAsIPNS ?? true,
+            sshRsyncEnabled: planet.sshRsyncEnabled ?? false,
+            sshRsyncDestination: MyPlanetModel.normalizedSSHRsyncDestination(
+                planet.sshRsyncDestination
+            ),
+            sshRsyncKeyPath: planet.sshRsyncKeyPath,
+            sshRsyncDeleteEnabled: planet.sshRsyncDeleteEnabled ?? false,
+            cloudflarePagesEnabled: planet.cloudflarePagesEnabled ?? false,
+            cloudflarePagesAccountID: normalizedOptionalString(planet.cloudflarePagesAccountID),
+            cloudflarePagesAPIToken: normalizedOptionalString(planet.cloudflarePagesAPIToken),
+            cloudflarePagesProjectName: normalizedOptionalString(planet.cloudflarePagesProjectName),
+            plausibleEnabled: planet.plausibleEnabled ?? false,
+            plausibleDomain: normalizedOptionalString(planet.plausibleDomain),
+            plausibleAPIKey: normalizedOptionalString(planet.plausibleAPIKey),
+            plausibleAPIServer: normalizedPlausibleAPIServer(planet.plausibleAPIServer),
+            twitterUsername: normalizedSocialUsername(planet.twitterUsername),
+            githubUsername: normalizedSocialUsername(planet.githubUsername),
+            telegramUsername: normalizedSocialUsername(planet.telegramUsername),
+            mastodonUsername: normalizedSocialUsername(planet.mastodonUsername),
+            discordLink: normalizedOptionalString(planet.discordLink),
+            juiceboxEnabled: planet.juiceboxEnabled ?? false,
+            juiceboxProjectID: planet.juiceboxProjectID,
+            pinnableEnabled: planet.pinnableEnabled ?? false,
+            pinnableAPIEndpoint: normalizedOptionalString(planet.pinnableAPIEndpoint),
+            filebaseEnabled: planet.filebaseEnabled ?? false,
+            filebasePinName: normalizedOptionalString(planet.filebasePinName),
+            filebaseAPIToken: normalizedOptionalString(planet.filebaseAPIToken),
+            templateSettings: currentSettings
+        )
+    }
+
+    private func desiredSnapshot() -> EditSnapshot {
+        let normalizedName = name.trim()
+        return EditSnapshot(
+            name: normalizedName.isEmpty ? planet.name.trim() : normalizedName,
+            about: about.trim(),
+            domain: normalizedOptionalString(domain),
+            authorName: normalizedOptionalString(authorName),
+            slug: normalizedSlug(slug),
+            templateName: templateName,
+            saveRoundAvatar: saveRoundAvatar,
+            doNotIndex: doNotIndex,
+            prewarmNewPost: prewarmNewPost,
+            publishAsIPNS: publishAsIPNS,
+            sshRsyncEnabled: sshRsyncEnabled,
+            sshRsyncDestination: MyPlanetModel.normalizedSSHRsyncDestination(
+                sshRsyncDestination
+            ),
+            sshRsyncKeyPath: sshRsyncKeyPath,
+            sshRsyncDeleteEnabled: sshRsyncDeleteEnabled,
+            cloudflarePagesEnabled: cloudflarePagesEnabled,
+            cloudflarePagesAccountID: normalizedOptionalString(cloudflarePagesAccountID),
+            cloudflarePagesAPIToken: normalizedOptionalString(cloudflarePagesAPIToken),
+            cloudflarePagesProjectName: normalizedOptionalString(cloudflarePagesProjectName),
+            plausibleEnabled: plausibleEnabled,
+            plausibleDomain: normalizedOptionalString(plausibleDomain),
+            plausibleAPIKey: normalizedOptionalString(plausibleAPIKey),
+            plausibleAPIServer: normalizedPlausibleAPIServer(plausibleAPIServer),
+            twitterUsername: normalizedSocialUsername(twitterUsername),
+            githubUsername: normalizedSocialUsername(githubUsername),
+            telegramUsername: normalizedSocialUsername(telegramUsername),
+            mastodonUsername: normalizedSocialUsername(mastodonUsername),
+            discordLink: normalizedOptionalString(discordLink),
+            juiceboxEnabled: juiceboxEnabled,
+            juiceboxProjectID: Int(juiceboxProjectID),
+            pinnableEnabled: pinnableEnabled,
+            pinnableAPIEndpoint: normalizedOptionalString(pinnableAPIEndpoint),
+            filebaseEnabled: filebaseEnabled,
+            filebasePinName: normalizedOptionalString(filebasePinName),
+            filebaseAPIToken: normalizedOptionalString(filebaseAPIToken),
+            templateSettings: userSettings
+        )
+    }
+
+    private func apply(_ snapshot: EditSnapshot) {
+        planet.name = snapshot.name
+        planet.about = snapshot.about
+        planet.domain = snapshot.domain
+        planet.authorName = snapshot.authorName
+        planet.slug = snapshot.slug
+        planet.templateName = snapshot.templateName
+        planet.saveRoundAvatar = snapshot.saveRoundAvatar
+        planet.doNotIndex = snapshot.doNotIndex
+        planet.prewarmNewPost = snapshot.prewarmNewPost
+        planet.publishAsIPNS = snapshot.publishAsIPNS
+        planet.sshRsyncEnabled = snapshot.sshRsyncEnabled
+        planet.sshRsyncDestination = snapshot.sshRsyncDestination
+        planet.sshRsyncKeyPath = snapshot.sshRsyncKeyPath
+        planet.sshRsyncDeleteEnabled = snapshot.sshRsyncDeleteEnabled
+        planet.cloudflarePagesEnabled = snapshot.cloudflarePagesEnabled
+        planet.cloudflarePagesAccountID = snapshot.cloudflarePagesAccountID
+        planet.cloudflarePagesAPIToken = snapshot.cloudflarePagesAPIToken
+        planet.cloudflarePagesProjectName = snapshot.cloudflarePagesProjectName
+        planet.plausibleEnabled = snapshot.plausibleEnabled
+        planet.plausibleDomain = snapshot.plausibleDomain
+        planet.plausibleAPIKey = snapshot.plausibleAPIKey
+        planet.plausibleAPIServer =
+            snapshot.plausibleAPIServer == "plausible.io" ? nil : snapshot.plausibleAPIServer
+        planet.twitterUsername = snapshot.twitterUsername
+        planet.githubUsername = snapshot.githubUsername
+        planet.telegramUsername = snapshot.telegramUsername
+        planet.mastodonUsername = snapshot.mastodonUsername
+        planet.discordLink = snapshot.discordLink
+        /*
+        planet.dWebServicesEnabled = dWebServicesEnabled
+        planet.dWebServicesDomain = dWebServicesDomain
+        planet.dWebServicesAPIKey = dWebServicesAPIKey
+        */
+        planet.juiceboxEnabled = snapshot.juiceboxEnabled
+        planet.juiceboxProjectID = snapshot.juiceboxProjectID
+        /* planet.juiceboxProjectIDGoerli = Int(juiceboxProjectIDGoerli) */
+        planet.pinnableEnabled = snapshot.pinnableEnabled
+        planet.pinnableAPIEndpoint = snapshot.pinnableAPIEndpoint
+        planet.filebaseEnabled = snapshot.filebaseEnabled
+        planet.filebasePinName = snapshot.filebasePinName
+        planet.filebaseAPIToken = snapshot.filebaseAPIToken
+        planet.updateTemplateSettings(settings: snapshot.templateSettings)
+    }
+
+    private func selectSSHKey() {
+        let panel = NSOpenPanel()
+        panel.title = L10n("Select SSH Private Key")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".ssh", isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let destination = planet.sshRsyncKeyStorePath
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: url, to: destination)
+            // Ensure the key file has strict permissions
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: destination.path
+            )
+            sshRsyncKeyPath = url.lastPathComponent
+        }
+        catch {
+            showValidationAlert(
+                title: "Failed to Import SSH Key",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    private func showValidationAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: L10n("OK"))
+        alert.runModal()
+    }
+
     func verifyUserInput() -> Int {
         var errors: Int = 0
         // TODO: Better sanity check goes here
@@ -995,14 +1411,52 @@ extension MyPlanetEditView {
             let range = NSRange(location: 0, length: domain.trim().count)
             if regex.firstMatch(in: domain.trim(), options: [], range: range) == nil {
                 errors += 1
-
-                let alert = NSAlert()
-                alert.messageText = "Invalid Domain Name"
-                alert.informativeText =
-                    "Please enter a valid domain name. Do not include the protocol (http:// or https://) or any trailing slashes."
-                alert.alertStyle = .informational
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
+                showValidationAlert(
+                    title: "Invalid Domain Name",
+                    message: "Please enter a valid domain name. Do not include the protocol (http:// or https://) or any trailing slashes."
+                )
+            }
+        }
+        if let slug = normalizedSlug(slug) {
+            let regex = try! NSRegularExpression(pattern: "^[A-Za-z0-9-]+$")
+            let range = NSRange(location: 0, length: slug.utf16.count)
+            if regex.firstMatch(in: slug, options: [], range: range) == nil {
+                errors += 1
+                showValidationAlert(
+                    title: "Planet Slug Issue",
+                    message: MESSAGE_SLUG_REQUIREMENT
+                )
+            }
+        }
+        if sshRsyncEnabled {
+            guard let destination = MyPlanetModel.normalizedSSHRsyncDestination(
+                sshRsyncDestination
+            ) else {
+                errors += 1
+                showValidationAlert(
+                    title: "Missing SSH rsync Address",
+                    message: "Enter a destination like user@example.com:/www/example before enabling SSH rsync publishing."
+                )
+                return errors
+            }
+            if !MyPlanetModel.isValidSSHRsyncDestination(destination) {
+                errors += 1
+                showValidationAlert(
+                    title: "Invalid SSH rsync Address",
+                    message: "Use the format user@example.com:/www/example."
+                )
+            }
+        }
+        if cloudflarePagesEnabled {
+            if cloudflarePagesAccountID.trim().isEmpty
+                || cloudflarePagesAPIToken.trim().isEmpty
+                || cloudflarePagesProjectName.trim().isEmpty
+            {
+                errors += 1
+                showValidationAlert(
+                    title: "Incomplete Cloudflare Pages Settings",
+                    message: "Account ID, API Token, and Project Name are all required when Cloudflare Pages publishing is enabled."
+                )
             }
         }
         return errors

@@ -13,9 +13,12 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
     static let shared = PlanetAppDelegate()
 
     var templateWindowController: TBWindowController?
+    @MainActor var planetAIChatWindowController: PlanetAIChatWindowController?
     var downloadsWindowController: PlanetDownloadsWindowController?
     var publishedFoldersDashboardWindowController: PFDashboardWindowController?
     var keyManagerWindowController: PlanetKeyManagerWindowController?
+    private var pendingQuickShareURLs: [URL] = []
+    private var pendingQuickShareTask: Task<Void, Never>?
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         return true
@@ -25,12 +28,39 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
     // Reference: https://developer.apple.com/forums/thread/673822
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
+        if url.absoluteString == "planet://Template" {
+            Task { @MainActor in
+                openTemplateWindow()
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            return
+        }
+        if url.isPlanetWindowGroupLink {
+            return
+        }
         if url.absoluteString.hasPrefix("planet://") {
             let link = url.absoluteString.replacingOccurrences(of: "planet://", with: "")
             Task { @MainActor in
-                let planet = try await FollowingPlanetModel.follow(link: link)
-                PlanetStore.shared.followingPlanets.insert(planet, at: 0)
-                PlanetStore.shared.selectedView = .followingPlanet(planet)
+                do {
+                    let planet = try await FollowingPlanetModel.follow(link: link)
+                    PlanetStore.shared.followingPlanets.insert(planet, at: 0)
+                    await PlanetStore.shared.saveFollowingPlanetsOrder()
+                    PlanetStore.shared.selectedView = .followingPlanet(planet)
+                    PlanetStore.shared.selectedArticle = planet.articles.first
+                    let sidebarID = "sidebar-following-\(planet.id.uuidString)"
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .scrollToSidebarItem, object: sidebarID)
+                        NotificationCenter.default.post(name: .scrollToTopArticleList, object: nil)
+                    }
+                }
+                catch PlanetError.PlanetExistsError {
+                    // ignore
+                }
+                catch {
+                    PlanetStore.shared.isShowingAlert = true
+                    PlanetStore.shared.alertTitle = L10n("Failed to Follow Planet")
+                    PlanetStore.shared.alertMessage = error.localizedDescription
+                }
             }
         } else if url.lastPathComponent.hasSuffix(".planet") {
             Task { @MainActor in
@@ -40,7 +70,7 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
                     PlanetStore.shared.selectedView = .myPlanet(planet)
                 } catch {
                     PlanetStore.shared.isShowingAlert = true
-                    PlanetStore.shared.alertTitle = "Failed to Import Planet"
+                    PlanetStore.shared.alertTitle = L10n("Failed to Import Planet")
                     PlanetStore.shared.alertMessage = error.localizedDescription
                 }
             }
@@ -51,18 +81,22 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
                 } catch {
                     debugPrint("failed to import articles: \(error)")
                     PlanetStore.shared.isShowingAlert = true
-                    PlanetStore.shared.alertTitle = "Failed to Import Articles"
+                    PlanetStore.shared.alertTitle = L10n("Failed to Import Articles")
                     switch error {
                     case PlanetError.ImportPlanetArticlePublishingError:
-                        PlanetStore.shared.alertMessage = "Planet is in publishing progress, please try again later."
+                        PlanetStore.shared.alertMessage = L10n("Planet is in publishing progress, please try again later.")
                     default:
                         PlanetStore.shared.alertMessage = error.localizedDescription
                     }
                 }
             }
         } else {
-            createQuickShareWindow(forFiles: urls)
+            queueQuickShareWindow(forFiles: urls)
         }
+    }
+
+    func application(_ application: NSApplication, continue userActivity: NSUserActivity, restorationHandler: @escaping ([NSUserActivityRestoring]) -> Void) -> Bool {
+        return PlanetStore.handleSpotlightActivity(userActivity)
     }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
@@ -106,26 +140,9 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
 
         setupNotification()
 
-        let saver = Saver.shared
-        if saver.isMigrationNeeded() {
-            Task { @MainActor in
-                PlanetStore.shared.isMigrating = true
-            }
-            var migrationErrors: Int = 0
-            migrationErrors = migrationErrors + saver.savePlanets()
-            migrationErrors = migrationErrors + saver.migratePublic()
-            migrationErrors = migrationErrors + saver.migrateTemplates()
-            if migrationErrors == 0 {
-                saver.setMigrationDoneFlag(flag: true)
-                Task { @MainActor in
-                    try PlanetStore.shared.load()
-                    try TemplateStore.shared.load()
-                }
-            }
-            Task { @MainActor in
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                PlanetStore.shared.isMigrating = false
-            }
+        // Prevent computer sleep if the setting is enabled (default: true)
+        if UserDefaults.standard.object(forKey: String.settingsPreventSleep) == nil || UserDefaults.standard.bool(forKey: String.settingsPreventSleep) {
+            SleepPreventer.shared.enable()
         }
 
         PlanetUpdater.shared.checkForUpdatesInBackground()
@@ -150,6 +167,8 @@ class PlanetAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .background).async {
             WebAppUpdater.shared.updateWebApp()
         }
+
+        NSApp.registerServicesMenuSendTypes([], returnTypes: WriterPasteboardImporter.readablePasteboardTypes)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -196,7 +215,7 @@ extension PlanetAppDelegate: UNUserNotificationCenterDelegate {
                             Task { @MainActor in
                                 PlanetStore.shared.selectedArticle = article
                             }
-                            NSWorkspace.shared.open(URL(string: "planet://")!)
+                            NSApp.activate(ignoringOtherApps: true)
                             return
                         }
                     }
@@ -206,7 +225,7 @@ extension PlanetAppDelegate: UNUserNotificationCenterDelegate {
                     let planetId = response.notification.request.identifier
                     if let following = PlanetStore.shared.followingPlanets.first(where: { $0.id.uuidString == planetId }) {
                         PlanetStore.shared.selectedView = .followingPlanet(following)
-                        NSWorkspace.shared.open(URL(string: "planet://")!)
+                        NSApp.activate(ignoringOtherApps: true)
                     }
                 }
             default:
@@ -229,6 +248,14 @@ extension PlanetAppDelegate: UNUserNotificationCenterDelegate {
 // MARK: - Window Controllers
 
 extension PlanetAppDelegate {
+    @MainActor
+    func openPlanetAIChatWindow() {
+        if planetAIChatWindowController == nil {
+            planetAIChatWindowController = PlanetAIChatWindowController()
+        }
+        planetAIChatWindowController?.showWindow(nil)
+    }
+
     func openDownloadsWindow() {
         if downloadsWindowController == nil {
             downloadsWindowController = PlanetDownloadsWindowController()
@@ -265,12 +292,38 @@ extension PlanetAppDelegate {
                 PlanetStore.shared.isQuickSharing = true
             } catch {
                 let alert = NSAlert()
-                alert.messageText = "Failed to Create Post"
+                alert.messageText = L10n("Failed to Create Post")
                 alert.informativeText = error.localizedDescription
                 alert.alertStyle = .warning
-                alert.addButton(withTitle: "OK")
+                alert.addButton(withTitle: L10n("OK"))
                 alert.runModal()
             }
+        }
+    }
+
+    private func queueQuickShareWindow(forFiles files: [URL]) {
+        let existingPaths = Set(pendingQuickShareURLs.map { $0.standardizedFileURL.path })
+        var pendingPaths = existingPaths
+        for file in files {
+            let path = file.standardizedFileURL.path
+            if pendingPaths.insert(path).inserted {
+                pendingQuickShareURLs.append(file)
+            }
+        }
+        pendingQuickShareTask?.cancel()
+        pendingQuickShareTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else {
+                return
+            }
+            let filesToOpen = pendingQuickShareURLs
+            pendingQuickShareURLs = []
+            pendingQuickShareTask = nil
+            createQuickShareWindow(forFiles: filesToOpen)
         }
     }
 }

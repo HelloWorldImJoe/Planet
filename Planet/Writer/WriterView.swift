@@ -15,7 +15,6 @@ enum RightView {
 struct WriterView: View {
     @ObservedObject var draft: DraftModel
     @ObservedObject var viewModel: WriterViewModel
-    @FocusState var focusTitle: Bool
     let dragAndDrop: WriterDragAndDrop
 
     @State private var videoPlayerHeight: CGFloat = 0
@@ -33,7 +32,7 @@ struct WriterView: View {
     var body: some View {
         VStack(spacing: 0) {
             if let videoAttachment = draft.attachments.first(where: { $0.type == .video }) {
-                WriterVideoView(videoAttachment: videoAttachment)
+                WriterVideoView(videoAttachment: videoAttachment, viewModel: viewModel)
                     .onAppear {
                         self.videoPlayerHeight = 270
                     }
@@ -56,8 +55,8 @@ struct WriterView: View {
                 tags: $draft.tags,
                 date: $draft.date,
                 title: $draft.title,
-                focusTitle: _focusTitle,
-                attachments: $draft.attachments
+                attachments: $draft.attachments,
+                handleTitlePaste: handleTitlePaste
             )
 
             Divider()
@@ -109,18 +108,26 @@ struct WriterView: View {
             try? draft.renderPreview()
         }
         .onChange(of: draft.attachments) { _ in
+            viewModel.syncVideoCompressionBackup(
+                for: draft.attachments.first(where: { $0.type == .video })
+            )
+            viewModel.syncVideoCompressionSummary(
+                for: draft.attachments.first(where: { $0.type == .video })
+            )
             if draft.attachments.contains(where: { $0.type == .image || $0.type == .file }) {
                 viewModel.isMediaTrayOpen = true
             }
             try? draft.renderPreview()
         }
         .onAppear {
+            viewModel.syncVideoCompressionBackup(
+                for: draft.attachments.first(where: { $0.type == .video })
+            )
+            viewModel.syncVideoCompressionSummary(
+                for: draft.attachments.first(where: { $0.type == .video })
+            )
             if draft.attachments.contains(where: { $0.type == .image || $0.type == .file }) {
                 viewModel.isMediaTrayOpen = true
-            }
-            Task { @MainActor in
-                // workaround: wrap in a task to delay focusing the title a little
-                focusTitle = true
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: WriterViewModel.choosingAttachment), perform: { _ in
@@ -298,8 +305,8 @@ struct WriterView: View {
 
     private func addAttachmentsAction() throws {
         let panel = NSOpenPanel()
-        panel.message = "Choose Attachments"
-        panel.prompt = "Choose"
+        panel.message = L10n("Choose Attachments")
+        panel.prompt = L10n("Choose")
         panel.allowsMultipleSelection = viewModel.allowMultipleSelection
         panel.allowedContentTypes = viewModel.allowedContentTypes
         panel.canChooseDirectories = false
@@ -323,5 +330,23 @@ struct WriterView: View {
         }
         try draft.renderPreview()
         try draft.save()
+    }
+
+    private func handleTitlePaste(_ pasteboard: NSPasteboard) -> Bool {
+        do {
+            return try WriterPasteboardImporter.importAttachments(
+                from: pasteboard,
+                into: draft,
+                insertMarkdown: { markdown in
+                    NotificationCenter.default.post(
+                        name: .writerNotification(.insertText, for: draft),
+                        object: markdown
+                    )
+                }
+            )
+        } catch {
+            debugPrint("failed to paste media into Writer title: \(error)")
+            return false
+        }
     }
 }

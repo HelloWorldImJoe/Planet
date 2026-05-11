@@ -21,7 +21,7 @@ struct IPFSCommand {
     static let IPFSRepositoryPath: URL = {
         // ~/Library/Containers/xyz.planetable.Planet/Data/Library/Application\ Support/ipfs/
         let url = URLUtils.applicationSupportPath.appendingPathComponent("ipfs", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
 
@@ -30,6 +30,10 @@ struct IPFSCommand {
     }()
 
     let arguments: [String]
+
+    private var commandDescription: String {
+        "ipfs " + arguments.joined(separator: " ")
+    }
 
     @discardableResult func run() throws -> (ret: Int, out: Data, err: Data) {
         let process = Process()
@@ -64,6 +68,7 @@ struct IPFSCommand {
         }
         process.standardError = errorPipe
 
+        IPFSLogger.log("[COMMAND] \(commandDescription)")
         try process.run()
 
         process.terminationHandler = { process in
@@ -73,15 +78,22 @@ struct IPFSCommand {
 
         outputPipe.fileHandleForReading.readabilityHandler = nil
         errorPipe.fileHandleForReading.readabilityHandler = nil
+        logCompletion(
+            commandDescription: commandDescription,
+            status: Int(process.terminationStatus),
+            stdout: outputData,
+            stderr: errorData
+        )
 
         return (Int(process.terminationStatus), outputData, errorData)
     }
 
+    @discardableResult
     func run(
         outHandler: ((_ data: Data) -> Void)? = nil,
         errHandler: ((_ data: Data) -> Void)? = nil,
         completionHandler: ((_ ret: Int) -> Void)? = nil
-    ) throws {
+    ) throws -> Process {
         let process = Process()
         process.executableURL = IPFSCommand.IPFSExecutablePath
         process.arguments = arguments
@@ -112,12 +124,40 @@ struct IPFSCommand {
         }
         process.standardError = errorPipe
 
+        IPFSLogger.log("[COMMAND] \(commandDescription)")
         try process.run()
 
         process.terminationHandler = { process in
             outputPipe.fileHandleForReading.readabilityHandler = nil
             errorPipe.fileHandleForReading.readabilityHandler = nil
+            IPFSLogger.log("[COMMAND] Finished (\(process.terminationStatus)): \(commandDescription)")
             completionHandler?(Int(process.terminationStatus))
+        }
+
+        return process
+    }
+
+    private func logCompletion(commandDescription: String, status: Int, stdout: Data, stderr: Data) {
+        let stdoutText = stdout.logFormat().trim()
+        let stderrText = stderr.logFormat().trim()
+
+        if status == 0 {
+            IPFSLogger.log("[COMMAND] Finished (\(status)): \(commandDescription)")
+            if !stdoutText.isEmpty {
+                IPFSLogger.log("[stdout] \(stdoutText)")
+            }
+            if !stderrText.isEmpty {
+                IPFSLogger.log("[stderr] \(stderrText)")
+            }
+            return
+        }
+
+        IPFSLogger.log("[ERROR] Command failed (\(status)): \(commandDescription)")
+        if !stdoutText.isEmpty {
+            IPFSLogger.log("[ERROR] [stdout] \(stdoutText)")
+        }
+        if !stderrText.isEmpty {
+            IPFSLogger.log("[ERROR] [stderr] \(stderrText)")
         }
     }
 

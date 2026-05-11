@@ -1,4 +1,426 @@
 import SwiftUI
+import UniformTypeIdentifiers
+
+@MainActor
+enum WriterPasteboardImporter {
+    private struct ImportedAttachmentFile {
+        let url: URL
+        let attachmentType: AttachmentType
+        let isTemporary: Bool
+    }
+
+    private static let supportedImagePasteboardTypes: [(type: NSPasteboard.PasteboardType, fileExtension: String)] = [
+        (NSPasteboard.PasteboardType(UTType.png.identifier), "png"),
+        (NSPasteboard.PasteboardType(UTType.jpeg.identifier), "jpg"),
+        (NSPasteboard.PasteboardType(UTType.gif.identifier), "gif"),
+        (NSPasteboard.PasteboardType(UTType.tiff.identifier), "tiff"),
+        (NSPasteboard.PasteboardType("public.heic"), "heic"),
+        (NSPasteboard.PasteboardType("public.heif"), "heif"),
+        (NSPasteboard.PasteboardType("public.webp"), "webp")
+    ]
+
+    private static let supportedVideoPasteboardTypes: [(type: NSPasteboard.PasteboardType, fileExtension: String)] = [
+        (NSPasteboard.PasteboardType(UTType.mpeg4Movie.identifier), "mp4"),
+        (NSPasteboard.PasteboardType(UTType.quickTimeMovie.identifier), "mov"),
+        (NSPasteboard.PasteboardType(UTType.movie.identifier), "mov")
+    ]
+
+    private static let supportedAudioPasteboardTypes: [(type: NSPasteboard.PasteboardType, fileExtension: String)] = [
+        (NSPasteboard.PasteboardType(UTType.mp3.identifier), "mp3"),
+        (NSPasteboard.PasteboardType(UTType.mpeg4Audio.identifier), "m4a"),
+        (NSPasteboard.PasteboardType(UTType.wav.identifier), "wav"),
+        (NSPasteboard.PasteboardType(UTType.audio.identifier), "m4a")
+    ]
+
+    private static let supportedFilePasteboardTypes: [(type: NSPasteboard.PasteboardType, fileExtension: String)] = [
+        (NSPasteboard.PasteboardType(UTType.pdf.identifier), "pdf")
+    ]
+
+    static var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        [.fileURL, NSPasteboard.PasteboardType(UTType.image.identifier)]
+            + supportedImagePasteboardTypes.map(\.type)
+            + supportedVideoPasteboardTypes.map(\.type)
+            + supportedAudioPasteboardTypes.map(\.type)
+            + supportedFilePasteboardTypes.map(\.type)
+    }
+
+    static func canImport(returnType: NSPasteboard.PasteboardType?) -> Bool {
+        guard let returnType else { return true }
+        return readablePasteboardTypes.contains(returnType)
+    }
+
+    static func importAttachments(
+        from pasteboard: NSPasteboard,
+        into draft: DraftModel,
+        insertMarkdown: (String) -> Void,
+        synchronizeContent: (() -> Void)? = nil
+    ) throws -> Bool {
+        let importedAttachments = try importedAttachmentFiles(from: pasteboard)
+        guard !importedAttachments.isEmpty else {
+            return false
+        }
+
+        defer {
+            cleanupTemporaryFiles(importedAttachments)
+        }
+
+        try insertImportedAttachments(importedAttachments, into: draft, insertMarkdown: insertMarkdown)
+        synchronizeContent?()
+        try draft.save()
+        try draft.renderPreview()
+        return true
+    }
+
+    private static func insertImportedAttachments(
+        _ importedAttachments: [ImportedAttachmentFile],
+        into draft: DraftModel,
+        insertMarkdown: (String) -> Void
+    ) throws {
+        guard resolveExclusiveAttachmentReplacement(
+            in: importedAttachments,
+            draft: draft,
+            attachmentType: .video
+        ) else {
+            return
+        }
+        guard resolveExclusiveAttachmentReplacement(
+            in: importedAttachments,
+            draft: draft,
+            attachmentType: .audio
+        ) else {
+            return
+        }
+
+        for exclusiveType in [AttachmentType.video, .audio] {
+            if importedAttachments.contains(where: { $0.attachmentType == exclusiveType }),
+               let existingAttachment = draft.attachments.first(where: { $0.type == exclusiveType }) {
+                draft.deleteAttachment(name: existingAttachment.name)
+            }
+        }
+
+        for importedAttachment in importedAttachments {
+            let attachment = try draft.addAttachment(
+                path: importedAttachment.url,
+                type: importedAttachment.attachmentType
+            )
+            if let markdown = attachment.markdown {
+                insertMarkdown(markdown)
+            }
+        }
+    }
+
+    private static func importedAttachmentFiles(from pasteboard: NSPasteboard) throws -> [ImportedAttachmentFile] {
+        var attachments: [ImportedAttachmentFile] = []
+
+        if let fileURLs = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+            for fileURL in fileURLs {
+                guard let attachmentType = supportedAttachmentType(for: fileURL) else {
+                    continue
+                }
+                attachments.append(
+                    try makeTemporaryAttachmentFile(from: fileURL, attachmentType: attachmentType)
+                )
+            }
+        }
+
+        if let items = pasteboard.pasteboardItems {
+            for item in items where !item.types.contains(.fileURL) {
+                if let importedAttachment = try makeTemporaryAttachmentFile(from: item) {
+                    attachments.append(importedAttachment)
+                }
+            }
+        } else if attachments.isEmpty,
+                  let fallbackAttachment = try makeTemporaryAttachmentFile(from: pasteboard) {
+            attachments.append(fallbackAttachment)
+        }
+
+        return attachments
+    }
+
+    private static func supportedAttachmentType(for url: URL) -> AttachmentType? {
+        guard url.isFileURL else { return nil }
+        if let fileType = UTType(filenameExtension: url.pathExtension.lowercased()) {
+            if fileType.conforms(to: .image) {
+                return .image
+            }
+            if fileType.conforms(to: .movie) || fileType.conforms(to: .video) {
+                return .video
+            }
+            if fileType.conforms(to: .audio) {
+                return .audio
+            }
+            if fileType.conforms(to: .pdf) {
+                return .file
+            }
+        }
+
+        let attachmentType = AttachmentType.from(url)
+        switch attachmentType {
+        case .image, .video, .audio:
+            return attachmentType
+        case .file:
+            return url.pathExtension.lowercased() == "pdf" ? .file : nil
+        }
+    }
+
+    private static func makeTemporaryAttachmentFile(
+        from pasteboard: NSPasteboard
+    ) throws -> ImportedAttachmentFile? {
+        for supportedType in supportedImagePasteboardTypes {
+            if let data = pasteboard.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .image,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        if let data = pasteboard.data(forType: NSPasteboard.PasteboardType(UTType.image.identifier)) {
+            return try makeTemporaryPNGImageFile(from: data)
+        }
+        for supportedType in supportedVideoPasteboardTypes {
+            if let data = pasteboard.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .video,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        for supportedType in supportedAudioPasteboardTypes {
+            if let data = pasteboard.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .audio,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        for supportedType in supportedFilePasteboardTypes {
+            if let data = pasteboard.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .file,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func makeTemporaryAttachmentFile(
+        from pasteboardItem: NSPasteboardItem
+    ) throws -> ImportedAttachmentFile? {
+        for supportedType in supportedImagePasteboardTypes {
+            if let data = pasteboardItem.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .image,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        if let data = pasteboardItem.data(forType: NSPasteboard.PasteboardType(UTType.image.identifier)) {
+            return try makeTemporaryPNGImageFile(from: data)
+        }
+        for supportedType in supportedVideoPasteboardTypes {
+            if let data = pasteboardItem.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .video,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        for supportedType in supportedAudioPasteboardTypes {
+            if let data = pasteboardItem.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .audio,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        for supportedType in supportedFilePasteboardTypes {
+            if let data = pasteboardItem.data(forType: supportedType.type) {
+                return try makeTemporaryAttachmentFile(
+                    from: data,
+                    attachmentType: .file,
+                    fileExtension: supportedType.fileExtension
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func makeTemporaryAttachmentFile(
+        from sourceURL: URL,
+        attachmentType: AttachmentType
+    ) throws -> ImportedAttachmentFile {
+        let typeIdentifier = try? sourceURL.resourceValues(forKeys: [.typeIdentifierKey]).typeIdentifier
+        let fileExtension = resolvedFileExtension(
+            preferred: sourceURL.pathExtension,
+            typeIdentifier: typeIdentifier,
+            attachmentType: attachmentType
+        )
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(fileExtension)
+        let accessedSecurityScope = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if accessedSecurityScope {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        try FileManager.default.copyItem(at: sourceURL, to: temporaryURL)
+        return ImportedAttachmentFile(
+            url: temporaryURL,
+            attachmentType: attachmentType,
+            isTemporary: true
+        )
+    }
+
+    private static func makeTemporaryAttachmentFile(
+        from data: Data,
+        attachmentType: AttachmentType,
+        fileExtension: String
+    ) throws -> ImportedAttachmentFile {
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(fileExtension)
+        try data.write(to: temporaryURL, options: .atomic)
+        return ImportedAttachmentFile(
+            url: temporaryURL,
+            attachmentType: attachmentType,
+            isTemporary: true
+        )
+    }
+
+    private static func makeTemporaryPNGImageFile(
+        from data: Data
+    ) throws -> ImportedAttachmentFile? {
+        guard let image = NSImage(data: data), let pngData = image.PNGData else {
+            return nil
+        }
+        return try makeTemporaryAttachmentFile(
+            from: pngData,
+            attachmentType: .image,
+            fileExtension: "png"
+        )
+    }
+
+    private static func resolvedFileExtension(
+        preferred: String,
+        typeIdentifier: String?,
+        attachmentType: AttachmentType
+    ) -> String {
+        if !preferred.isEmpty {
+            return preferred.lowercased()
+        }
+        if let typeIdentifier,
+           let matchedType = supportedPasteboardTypes(for: attachmentType)
+               .first(where: { $0.type.rawValue == typeIdentifier }) {
+            return matchedType.fileExtension
+        }
+
+        switch attachmentType {
+        case .video:
+            return "mov"
+        case .audio:
+            return "m4a"
+        case .file:
+            return "pdf"
+        default:
+            return "png"
+        }
+    }
+
+    private static func supportedPasteboardTypes(
+        for attachmentType: AttachmentType
+    ) -> [(type: NSPasteboard.PasteboardType, fileExtension: String)] {
+        switch attachmentType {
+        case .image:
+            return supportedImagePasteboardTypes
+        case .video:
+            return supportedVideoPasteboardTypes
+        case .audio:
+            return supportedAudioPasteboardTypes
+        case .file:
+            return supportedFilePasteboardTypes
+        }
+    }
+
+    private static func resolveExclusiveAttachmentReplacement(
+        in importedAttachments: [ImportedAttachmentFile],
+        draft: DraftModel,
+        attachmentType: AttachmentType
+    ) -> Bool {
+        let newAttachments = importedAttachments.filter { $0.attachmentType == attachmentType }
+        guard !newAttachments.isEmpty else { return true }
+        if newAttachments.count > 1 {
+            presentPasteAlert(
+                title: "Failed to Paste \(attachmentDisplayName(for: attachmentType))",
+                message: "Writer only supports one \(attachmentDisplayName(for: attachmentType).lowercased()) attachment. Paste a single \(attachmentDisplayName(for: attachmentType).lowercased()) at a time."
+            )
+            return false
+        }
+        guard let existingAttachment = draft.attachments.first(where: { $0.type == attachmentType }) else {
+            return true
+        }
+        return confirmExclusiveAttachmentReplacement(
+            attachmentType: attachmentType,
+            existingAttachmentName: existingAttachment.name
+        )
+    }
+
+    private static func confirmExclusiveAttachmentReplacement(
+        attachmentType: AttachmentType,
+        existingAttachmentName: String
+    ) -> Bool {
+        let alert = NSAlert()
+        let attachmentName = attachmentDisplayName(for: attachmentType)
+        alert.messageText = String(format: L10n("Replace Existing %@?"), attachmentName)
+        alert.informativeText =
+            String(
+                format: L10n("This article already has a %@ attachment (%@). Replace it with the pasted %@?"),
+                attachmentName.lowercased(),
+                existingAttachmentName,
+                attachmentName.lowercased()
+            )
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: L10n("Replace"))
+        alert.addButton(withTitle: L10n("Cancel"))
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private static func attachmentDisplayName(for attachmentType: AttachmentType) -> String {
+        switch attachmentType {
+        case .video:
+            return L10n("Video")
+        case .audio:
+            return L10n("Audio")
+        case .file:
+            return L10n("Document")
+        default:
+            return L10n("Attachment")
+        }
+    }
+
+    private static func presentPasteAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: L10n("OK"))
+        alert.runModal()
+    }
+
+    private static func cleanupTemporaryFiles(_ importedAttachments: [ImportedAttachmentFile]) {
+        for importedAttachment in importedAttachments where importedAttachment.isTemporary {
+            try? FileManager.default.removeItem(at: importedAttachment.url)
+        }
+    }
+}
 
 struct WriterTextView: NSViewRepresentable {
     @ObservedObject var draft: DraftModel
@@ -19,7 +441,7 @@ struct WriterTextView: NSViewRepresentable {
         NotificationCenter.default.addObserver(
             forName: .writerNotification(.insertText, for: draft),
             object: nil,
-            queue: .main
+            queue: nil
         ) { notification in
             guard let text = notification.object as? String else { return }
             textView.insertTextAtCursor(text: text)
@@ -27,7 +449,7 @@ struct WriterTextView: NSViewRepresentable {
         NotificationCenter.default.addObserver(
             forName: .writerNotification(.removeText, for: draft),
             object: nil,
-            queue: .main
+            queue: nil
         ) { notification in
             guard let text = notification.object as? String else { return }
             textView.removeTargetText(text: text)
@@ -36,7 +458,7 @@ struct WriterTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: WriterCustomTextView, context: Context) {
-        nsView.text = text
+        nsView.updateText(text, preferredSelectedRanges: context.coordinator.selectedRanges)
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
@@ -51,6 +473,7 @@ struct WriterTextView: NSViewRepresentable {
             guard let textView = notification.object as? WriterEditorTextView else {
                 return
             }
+            guard !textView.hasMarkedText() else { return }
             parent.text = textView.string
         }
 
@@ -58,9 +481,10 @@ struct WriterTextView: NSViewRepresentable {
             guard let textView = notification.object as? WriterEditorTextView else {
                 return
             }
+            selectedRanges = textView.selectedRanges
+            guard !textView.hasMarkedText() else { return }
             parent.text = textView.string
             parent.selectedRanges = textView.selectedRanges
-            selectedRanges = textView.selectedRanges
         }
 
         func textDidEndEditing(_ notification: Notification) {
@@ -169,6 +593,32 @@ class WriterCustomTextView: NSView {
         textView.insertText(text, replacementRange: range)
     }
 
+    func updateText(_ text: String, preferredSelectedRanges: [NSValue]) {
+        self.text = text
+        guard !textView.hasMarkedText() else { return }
+        guard textView.string != text else {
+            return
+        }
+
+        let targetRanges = preferredSelectedRanges.compactMap { value -> NSValue? in
+            let range = value.rangeValue
+            guard range.location != NSNotFound,
+                range.location + range.length <= (text as NSString).length
+            else {
+                return nil
+            }
+            return value
+        }
+
+        textView.string = text
+        if targetRanges.isEmpty {
+            let end = (text as NSString).length
+            textView.setSelectedRange(NSRange(location: end, length: 0))
+        } else {
+            textView.selectedRanges = targetRanges
+        }
+    }
+
     func removeTargetText(text: String) {
         let text = textView.string.replacingOccurrences(of: text, with: "")
         textView.string = text
@@ -177,34 +627,113 @@ class WriterCustomTextView: NSView {
     }
 }
 
-class WriterEditorTextView: NSTextView {
+class WriterEditorTextView: MarkdownEditorTextView {
     @ObservedObject var draft: DraftModel
+    private let monoFont: NSFont
 
     var processedURLs: [URL] = []
 
     init(draft: DraftModel, frame: NSRect, textContainer: NSTextContainer) {
         self.draft = draft
+        self.monoFont = NSFont(name: "Menlo", size: 14) ?? .monospacedSystemFont(ofSize: 14, weight: .regular)
         super.init(frame: frame, textContainer: textContainer)
-        self.isAutomaticQuoteSubstitutionEnabled = false
-        self.isAutomaticDashSubstitutionEnabled = false
-        self.isAutomaticTextReplacementEnabled = false
-        self.enabledTextCheckingTypes = 0
     }
 
     required init?(coder: NSCoder) {
         fatalError("WriterEditorTextView: required init?(coder: NSCoder) not implemented")
     }
 
+    // Always enforce the mono font in typingAttributes so that all inserted
+    // text (typing, IME, paste, programmatic) uses the correct font.
+    override var typingAttributes: [NSAttributedString.Key: Any] {
+        get {
+            var attrs = super.typingAttributes
+            attrs[.font] = monoFont
+            return attrs
+        }
+        set {
+            var attrs = newValue
+            attrs[.font] = monoFont
+            super.typingAttributes = attrs
+        }
+    }
+
+    override func insertBacktab(_ sender: Any?) {
+        guard let contentView = window?.contentView else { return }
+        if let titleTextView = Self.findSubview(ofType: WriterTitleEditorTextView.self, in: contentView) {
+            window?.makeFirstResponder(titleTextView)
+        }
+    }
+
+    private static func findSubview<T: NSView>(ofType type: T.Type, in view: NSView) -> T? {
+        if let match = view as? T { return match }
+        for subview in view.subviews {
+            if let found = findSubview(ofType: type, in: subview) { return found }
+        }
+        return nil
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
     }
 
+    override func validRequestor(
+        forSendType sendType: NSPasteboard.PasteboardType?,
+        returnType: NSPasteboard.PasteboardType?
+    ) -> Any? {
+        if sendType == nil, WriterPasteboardImporter.canImport(returnType: returnType) {
+            return self
+        }
+        return super.validRequestor(forSendType: sendType, returnType: returnType)
+    }
+
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
-        [.string]
+        [.string] + WriterPasteboardImporter.readablePasteboardTypes
     }
 
     override var acceptableDragTypes: [NSPasteboard.PasteboardType] {
         [.fileURL]
+    }
+
+    override func paste(_ sender: Any?) {
+        let pasteboard = NSPasteboard.general
+        do {
+            if try importAttachments(from: pasteboard) {
+                return
+            }
+        } catch {
+            debugPrint("failed to paste media into Writer: \(error)")
+            return
+        }
+        if pasteboard.availableType(from: [.string]) != nil {
+            super.paste(sender)
+        }
+    }
+
+    override func readSelection(from pboard: NSPasteboard) -> Bool {
+        do {
+            if try importAttachments(from: pboard) {
+                return true
+            }
+        } catch {
+            debugPrint("failed to read pasted selection into Writer: \(error)")
+        }
+        return super.readSelection(from: pboard)
+    }
+
+    override func readSelection(
+        from pboard: NSPasteboard,
+        type: NSPasteboard.PasteboardType
+    ) -> Bool {
+        do {
+            if WriterPasteboardImporter.canImport(returnType: type),
+               try importAttachments(from: pboard) {
+                return true
+            }
+        } catch {
+            debugPrint("failed to read pasted selection type into Writer: \(error)")
+        }
+        return super.readSelection(from: pboard, type: type)
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -229,114 +758,32 @@ class WriterEditorTextView: NSTextView {
     override func concludeDragOperation(_ sender: (any NSDraggingInfo)?) {
         super.concludeDragOperation(sender)
         guard processedURLs.count > 0 else { return }
-        processedURLs.forEach { url in
-            if let attachment = try? draft.addAttachment(path: url, type: AttachmentType.from(url)),
-               let markdown = attachment.markdown {
-                NotificationCenter.default.post(
-                    name: .writerNotification(.insertText, for: attachment.draft),
-                    object: markdown
-                )
+        let droppedURLs = processedURLs
+        processedURLs = []
+        Task { @MainActor in
+            await WriterDragAndDrop.handleDroppedFiles(
+                droppedURLs,
+                for: draft,
+                insertAttachmentMarkdown: true
+            )
+        }
+    }
+
+    private func importAttachments(from pasteboard: NSPasteboard) throws -> Bool {
+        try WriterPasteboardImporter.importAttachments(
+            from: pasteboard,
+            into: draft,
+            insertMarkdown: { [weak self] markdown in
+                guard let self else { return }
+                var range = self.selectedRange()
+                range.length = 0
+                self.insertText(markdown, replacementRange: range)
+            },
+            synchronizeContent: { [weak self] in
+                guard let self else { return }
+                self.draft.content = self.string
             }
-        }
-        try? draft.save()
+        )
     }
 
-    // MARK: - Process enter / return key event
-
-    override func keyDown(with event: NSEvent) {
-        super.keyDown(with: event)
-        switch event.keyCode {
-            case 36, 76:
-                do {
-                    try processEnterOrReturnEvent()
-                } catch {
-                    debugPrint("failed to process enter / return event: \(error)")
-                }
-            default:
-                break
-        }
-    }
-
-    private func processEnterOrReturnEvent() throws {
-        let selectedRange = self.selectedRange()
-        let location = selectedRange.location - 1
-        let content = NSString(string: self.string)
-        let start = getLocationOfFirstNewline(fromString: content, beforeLocation: UInt(location))
-        let end = UInt(location)
-        let range = NSRange(location: Int(start), length: Int(end - start))
-        let line = NSString(string: content.substring(with: range))
-        let regex = try NSRegularExpression(pattern: "^(\\s*)((?:(?:\\*|\\+|-|)\\s+)?)((?:\\d+\\.\\s+)?)(\\S)?", options: .anchorsMatchLines)
-        guard let result: NSTextCheckingResult = regex.firstMatch(in: line as String, range: NSRange(location: 0, length: line.length)) else { return }
-        let indent = NSString(string: line.substring(with: result.range(at: 1)))
-        let prefix = getPrefix(result: result, line: line, start: start, indent: indent, selectedRange: selectedRange, range: range)
-        guard prefix != "" else { return }
-        var targetRange = selectedRange
-        targetRange.length = 0
-        var extendedContent = NSString(format: "%@%@ ", indent, prefix)
-        extendedContent = getExtendedContent(line: line, indent: indent, prefix: prefix, extendedContent: extendedContent, range: range)
-        self.insertText(extendedContent, replacementRange: targetRange)
-    }
-
-    private func getLocationOfFirstNewline(fromString string: NSString, beforeLocation loc: UInt) -> UInt {
-        var location: UInt = loc
-        if location > string.length {
-            location = UInt(string.length)
-        }
-        var start: UInt = 0
-        string.getLineStart(&start, end: nil, contentsEnd: nil, for: NSRange(location: Int(location), length: 0))
-        return start
-    }
-
-    private func getPrefix(result: NSTextCheckingResult, line: NSString, start: UInt, indent: NSString, selectedRange: NSRange, range: NSRange) -> NSString {
-        var prefix: NSString = NSString(string: "")
-        let isUnordered = result.range(at: 2).length != 0
-        let isOrdered = result.range(at: 3).length != 0
-        let isPreviousLineEmpty = result.range(at: 4).length == 0
-        if isPreviousLineEmpty {
-            var replaceRange = NSRange(location: NSNotFound, length: 0)
-            if isUnordered {
-                replaceRange = result.range(at: 2)
-            } else if isOrdered {
-                replaceRange = result.range(at: 3)
-            }
-            if replaceRange.length > 0 {
-                replaceRange.location += Int(start)
-                if indent != "" {
-                    // keep sublevel indent after return.
-                    var targetRange = selectedRange
-                    targetRange.length = 0
-                    self.insertText(indent, replacementRange: targetRange)
-                }
-                self.shouldChangeText(in: range, replacementString: nil)
-                self.replaceCharacters(in: range, with: "")
-            }
-        } else if isUnordered {
-            var theRange = result.range(at: 2)
-            theRange.length -= 1
-            prefix = NSString(string: line.substring(with: theRange))
-        } else if isOrdered {
-            var theRange = result.range(at: 3)
-            theRange.length -= 1
-            let capturedIndex = NSString(string: line.substring(with: theRange)).integerValue
-            prefix = NSString(format: "%ld.", capturedIndex + 1)
-        }
-        return prefix
-    }
-
-    private func getExtendedContent(line: NSString, indent: NSString, prefix: NSString, extendedContent: NSString, range: NSRange) -> NSString {
-        var extendedContent = extendedContent
-        // Improvements for todo item in unordered list:
-        // "- [ ] "
-        // "- [x] "
-        // "- [X] "
-        if line.hasPrefix("- [ ] ") || line.hasPrefix("- [x] ") || line.hasPrefix("- [X] ") {
-            if line.length == "- [ ] ".count {
-                extendedContent = NSString(format: "")
-                self.replaceCharacters(in: range, with: "")
-            } else {
-                extendedContent = NSString(format: "%@%@ [ ] ", indent, prefix)
-            }
-        }
-        return extendedContent
-    }
 }

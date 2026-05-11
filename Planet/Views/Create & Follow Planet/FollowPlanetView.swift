@@ -28,7 +28,7 @@ struct FollowPlanetView: View {
 
             VStack {
                 if isFollowing {
-                    Text("Following \(link)")
+                    Text(L10n("Following %@", link))
                     ProgressView()
                         .progressViewStyle(.linear)
                 } else {
@@ -124,16 +124,13 @@ struct FollowPlanetView: View {
                     Task {
                         await planetStore.saveFollowingPlanetsOrder()
                     }
-                    Task {
-                        await planet.refreshIcon()
-                    }
-                    Task {
-                        await planet.findWalletAddress()
-                    }
-                    Task.detached(priority: .background) {
-                        await planet.pin()
-                    }
                     planetStore.selectedView = .followingPlanet(planet)
+                    planetStore.selectedArticle = planet.articles.first
+                    let sidebarID = "sidebar-following-\(planet.id.uuidString)"
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(name: .scrollToSidebarItem, object: sidebarID)
+                        NotificationCenter.default.post(name: .scrollToTopArticleList, object: nil)
+                    }
                 }
             } catch PlanetError.PlanetExistsError {
                 // ignore

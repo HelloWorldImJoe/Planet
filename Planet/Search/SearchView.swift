@@ -12,10 +12,19 @@ struct SearchView: View {
 
     @State private var result: [SearchResult] = []
     @State private var focusedResult: SearchResult?
+    @State private var searchText: String
+    @State private var isSearching = false
 
-    @AppStorage("searchText") private var searchText: String = ""
+    @AppStorage("searchText") private var storedSearchText: String = ""
+    @State private var searchTask: Task<Void, Never>?
 
     @Environment(\.dismiss) private var dismiss
+    private let searchEmptyAnchorID = "search-results-empty-anchor"
+    private let searchDebounceNanoseconds: UInt64 = 50_000_000
+
+    init() {
+        _searchText = State(initialValue: UserDefaults.standard.string(forKey: "searchText") ?? "")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,93 +56,126 @@ struct SearchView: View {
             }
             Divider()
             ScrollViewReader { proxy in
-                VStack(spacing: 0) {
-//                    searchResult()
-                    if result.count > 0 {
-                        searchResultView()
-                    } else {
-                        List {
-                        }.padding(0)
+                searchResultView()
+                    .onChange(of: result.map(\.articleID)) { _ in
+                        Task { @MainActor in
+                            await Task.yield()
+                            if let firstID = result.first?.articleID {
+                                proxy.scrollTo(firstID, anchor: .top)
+                            } else {
+                                proxy.scrollTo(searchEmptyAnchorID, anchor: .top)
+                            }
+                        }
+                        if let focusedResult, !result.contains(focusedResult) {
+                            self.focusedResult = nil
+                        }
                     }
-                }
-                .id("top")
-                .onChange(of: result.count) { _ in
-                    proxy.scrollTo("top", anchor: .top)
-                }
-                .onChange(of: focusedResult) { _ in
-                    if let id = focusedResult?.articleID {
-                        proxy.scrollTo(id)
+                    .onChange(of: focusedResult?.articleID) { id in
+                        if let id = id {
+                            withAnimation(.easeInOut(duration: 0.12)) {
+                                proxy.scrollTo(id, anchor: .center)
+                            }
+                        }
                     }
-                }
             }
             Divider()
             statusView()
         }
         .frame(minWidth: 500, minHeight: 300)
         .onChange(of: searchText) { _ in
-            debounceSearch()
+            scheduleSearch()
         }
         .onAppear {
-            search()
+            if !trimmedSearchText.isEmpty {
+                scheduleSearch(immediately: true)
+            }
+        }
+        .onDisappear {
+            searchTask?.cancel()
+            searchTask = nil
+            isSearching = false
+            storedSearchText = searchText
         }
     }
 
-    @State private var searchTimer: Timer?
-
-    private let searchDebounceInterval: TimeInterval = 0.08  // 80 milliseconds
-
-    private func debounceSearch() {
-        // Invalidate and nullify the existing timer if it exists
-        searchTimer?.invalidate()
-        searchTimer = nil
-
-        // Create and schedule a new timer
-        searchTimer = Timer.scheduledTimer(withTimeInterval: searchDebounceInterval, repeats: false)
-        { _ in
-            debugPrint("New search text length: \(self.searchText.count)")
-            if self.searchText.count == 0 {
-                self.result = []
-            }
-            else {
-                self.search()
-            }
-            focusedResult = nil
-        }
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func search() {
-        let searchText = searchText
-        if searchText != "" {
-            Task(priority: .userInitiated) {
-                let items = await planetStore.searchAllArticles(text: searchText)
-                DispatchQueue.main.async {
-                    let latestSearchText = searchText
-                    if latestSearchText != searchText {
-                        return
-                    }
-                    result = items
+    @MainActor
+    private func restoreSelectionAndScroll(
+        targetArticleID: UUID,
+        targetPlanetID: UUID,
+        isMyPlanet: Bool,
+        fallbackArticle: ArticleModel
+    ) async {
+        // Retry because selectedView refreshes the article list asynchronously.
+        let retryDelays: [UInt64] = [80_000_000, 180_000_000, 320_000_000]
+
+        for delay in retryDelays {
+            try? await Task.sleep(nanoseconds: delay)
+
+            if isMyPlanet {
+                guard case .myPlanet(let selectedPlanet) = planetStore.selectedView,
+                    selectedPlanet.id == targetPlanetID
+                else {
+                    continue
+                }
+            } else {
+                guard case .followingPlanet(let selectedPlanet) = planetStore.selectedView,
+                    selectedPlanet.id == targetPlanetID
+                else {
+                    continue
                 }
             }
+
+            if let article = planetStore.selectedArticleList?.first(where: { $0.id == targetArticleID }) {
+                planetStore.selectedArticle = article
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                NotificationCenter.default.post(name: .scrollToArticle, object: article)
+                return
+            }
         }
+
+        // Fallback if list refresh is delayed but we still need to navigate.
+        planetStore.selectedArticle = fallbackArticle
+        NotificationCenter.default.post(name: .scrollToArticle, object: fallbackArticle)
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        NotificationCenter.default.post(name: .scrollToArticle, object: fallbackArticle)
     }
 
-    @ViewBuilder
-    private func searchResult() -> some View {
-        if result.count > 0 {
-            List {
-                ForEach(result, id: \.self) { item in
-                    searchResultRow(item)
-                        .onTapGesture {
-                            goToArticle(item)
-                        }
-                }
-            }
-            .padding(0)
-            .listStyle(PlainListStyle())
+    private func scheduleSearch(immediately: Bool = false) {
+        let query = trimmedSearchText
+        focusedResult = nil
+
+        guard !query.isEmpty else {
+            searchTask?.cancel()
+            searchTask = nil
+            isSearching = false
+            result = []
+            storedSearchText = ""
+            return
         }
-        else {
-            List {
-            }.padding(0)
+
+        searchTask?.cancel()
+        isSearching = true
+        searchTask = Task(priority: .userInitiated) {
+            if !immediately {
+                try? await Task.sleep(nanoseconds: searchDebounceNanoseconds)
+            }
+            guard !Task.isCancelled else { return }
+
+            let items = await planetStore.searchAllArticles(text: query)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard query == self.trimmedSearchText else {
+                    return
+                }
+                self.storedSearchText = self.searchText
+                self.result = items
+                self.isSearching = false
+            }
         }
     }
 
@@ -141,7 +183,23 @@ struct SearchView: View {
     private func searchResultView() -> some View {
         ZStack {
             List {
-                ForEach(result, id: \.self) { item in
+                if result.isEmpty {
+                    HStack {
+                        Spacer()
+                        Text(
+                            trimmedSearchText.isEmpty
+                                ? "Start typing to search"
+                                : (isSearching ? "Searching..." : "No matching articles")
+                        )
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .padding(.vertical, 20)
+                    .modifier(SearchEmptyRowSeparatorModifier())
+                    .id(searchEmptyAnchorID)
+                }
+
+                ForEach(result, id: \.articleID) { item in
                     searchResultRow(item)
                         .id(item.articleID)
                         .onTapGesture {
@@ -151,6 +209,7 @@ struct SearchView: View {
             }
             .padding(0)
             .listStyle(PlainListStyle())
+            .animation(nil, value: result.map(\.articleID))
             // arrow key navigation hack
             VStack {
                 Spacer()
@@ -247,25 +306,25 @@ struct SearchView: View {
                     let article = planet.articles.first(where: { $0.id == item.articleID })
                 {
                     planetStore.selectedView = .myPlanet(planet)
-
-                    Task(priority: .userInitiated) { @MainActor in
-                        planetStore.selectedArticle = article
-                        Task(priority: .userInitiated) { @MainActor in
-                            NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                        }
-                    }
+                    NotificationCenter.default.post(name: .scrollToSidebarItem, object: "sidebar-my-\(planet.id.uuidString)")
+                    await restoreSelectionAndScroll(
+                        targetArticleID: item.articleID,
+                        targetPlanetID: item.planetID,
+                        isMyPlanet: true,
+                        fallbackArticle: article
+                    )
                 }
             case .following:
                 if let planet = planetStore.followingPlanets.first(where: { $0.id == item.planetID }
                 ), let article = planet.articles.first(where: { $0.id == item.articleID }) {
                     planetStore.selectedView = .followingPlanet(planet)
-
-                    Task(priority: .userInitiated) { @MainActor in
-                        planetStore.selectedArticle = article
-                        Task(priority: .userInitiated) { @MainActor in
-                            NotificationCenter.default.post(name: .scrollToArticle, object: article)
-                        }
-                    }
+                    NotificationCenter.default.post(name: .scrollToSidebarItem, object: "sidebar-following-\(planet.id.uuidString)")
+                    await restoreSelectionAndScroll(
+                        targetArticleID: item.articleID,
+                        targetPlanetID: item.planetID,
+                        isMyPlanet: false,
+                        fallbackArticle: article
+                    )
                 }
             }
         }
@@ -312,8 +371,14 @@ struct SearchView: View {
     @ViewBuilder
     private func statusView() -> some View {
         HStack {
-            if result.count > 1 {
-                Text("\(result.count) results")
+            if isSearching {
+                ProgressView()
+                    .controlSize(.small)
+                Text(result.isEmpty ? L10n("Searching...") : L10n("Updating results..."))
+                    .foregroundColor(.secondary)
+            }
+            else if result.count > 1 {
+                Text(L10n("%d results", result.count))
                     .foregroundColor(.secondary)
             }
             else if result.count == 1 {
@@ -325,6 +390,17 @@ struct SearchView: View {
                 dismiss()
             }
         }.padding(10)
+    }
+}
+
+private struct SearchEmptyRowSeparatorModifier: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(macOS 13.0, *) {
+            content.listRowSeparator(.hidden)
+        } else {
+            content
+        }
     }
 }
 

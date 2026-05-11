@@ -7,6 +7,7 @@
 
 import AppKit
 import CoreImage
+import Dispatch
 import Foundation
 import PathKit
 import Stencil
@@ -20,10 +21,87 @@ struct TemplateSetting: Codable, Hashable, Identifiable {
     var advanced: Bool? = false  // Show the setting in a separate Advanced tab
 
     var id: String { name }
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case type
+        case defaultValue
+        case description
+        case advanced
+    }
+
+    init(
+        name: String,
+        type: String,
+        defaultValue: String,
+        description: String,
+        advanced: Bool? = false
+    ) {
+        self.name = name
+        self.type = type
+        self.defaultValue = defaultValue
+        self.description = description
+        self.advanced = advanced
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        type = try container.decode(String.self, forKey: .type)
+        description = try container.decode(String.self, forKey: .description)
+        advanced = try container.decodeIfPresent(Bool.self, forKey: .advanced) ?? false
+
+        defaultValue = try Self.decodeDefaultValue(from: container)
+    }
+
+    private static func decodeDefaultValue(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> String {
+        if let value = try? container.decode(String.self, forKey: .defaultValue) {
+            return value
+        }
+        if let value = try? container.decode(Bool.self, forKey: .defaultValue) {
+            return value ? "true" : "false"
+        }
+        if let value = try? container.decode(Int.self, forKey: .defaultValue) {
+            return value.description
+        }
+        if let value = try? container.decode(UInt64.self, forKey: .defaultValue) {
+            return value.description
+        }
+        if let value = try? container.decode(Decimal.self, forKey: .defaultValue) {
+            return NSDecimalNumber(decimal: value).stringValue
+        }
+        if let value = try? container.decode(Double.self, forKey: .defaultValue) {
+            return value.description
+        }
+        return try container.decode(String.self, forKey: .defaultValue)
+    }
+}
+
+struct ArticleTemplateRenderPerfBreakdown {
+    var markdownDuration: UInt64 = 0
+    var aboutDuration: UInt64 = 0
+    var contextDuration: UInt64 = 0
+    var contextHasPodcastDuration: UInt64 = 0
+    var contextPublicPlanetDuration: UInt64 = 0
+    var contextSiteNavigationDuration: UInt64 = 0
+    var contextHasAvatarDuration: UInt64 = 0
+    var contextUserSettingsDuration: UInt64 = 0
+    var contextPublicArticleDuration: UInt64 = 0
+    var contextStyleCSSHashDuration: UInt64 = 0
+    var customCodeDuration: UInt64 = 0
+    var stencilDuration: UInt64 = 0
 }
 
 class Template: Codable, Identifiable {
     static let logger = Logger(subsystem: Bundle.main.bundleIdentifier!, category: "Template")
+    private static func perfNow() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+    private static func perfElapsed(since startedAt: UInt64) -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds - startedAt
+    }
 
     let name: String
     let description: String
@@ -175,10 +253,6 @@ class Template: Codable, Identifiable {
             logger.error("Template directory \(directoryName) has no blog.html")
             return nil
         }
-        guard FileManager.default.fileExists(atPath: template.assetsPath.path) else {
-            logger.error("Template directory \(directoryName) has no assets directory")
-            return nil
-        }
         return template
     }
 
@@ -210,10 +284,21 @@ class Template: Codable, Identifiable {
     }
 
     func render(article: MyArticleModel, forSimpleHTML: Bool = false) throws -> String {
+        var perf = ArticleTemplateRenderPerfBreakdown()
+        return try render(article: article, forSimpleHTML: forSimpleHTML, perf: &perf)
+    }
+
+    func render(
+        article: MyArticleModel,
+        forSimpleHTML: Bool = false,
+        perf: inout ArticleTemplateRenderPerfBreakdown
+    ) throws -> String {
         // render markdown
+        let markdownStartedAt = Self.perfNow()
         guard let content_html = CMarkRenderer.renderMarkdownHTML(markdown: article.content) else {
             throw PlanetError.RenderMarkdownError
         }
+        perf.markdownDuration = Self.perfElapsed(since: markdownStartedAt)
 
         guard let planet = article.planet else {
             throw PlanetError.RenderMarkdownError
@@ -227,7 +312,12 @@ class Template: Codable, Identifiable {
             }
         }
 
+        let contextStartedAt = Self.perfNow()
+        let hasPodcastStartedAt = Self.perfNow()
         let hasPodcast = planet.articles.contains(where: { $0.hasAudioContent() })
+        perf.contextHasPodcastDuration = Self.perfElapsed(since: hasPodcastStartedAt)
+
+        let publicPlanetStartedAt = Self.perfNow()
         let publicPlanet = PublicPlanetModel(
             id: planet.id,
             name: planet.name,
@@ -242,8 +332,6 @@ class Template: Codable, Identifiable {
             juiceboxEnabled: planet.juiceboxEnabled ?? false,
             juiceboxProjectID: planet.juiceboxProjectID,
             juiceboxProjectIDGoerli: planet.juiceboxProjectIDGoerli,
-            farcasterEnabled: planet.farcasterEnabled ?? false,
-            farcasterUsername: planet.farcasterUsername ?? nil,
             acceptsDonation: planet.acceptsDonation ?? false,
             acceptsDonationMessage: planet.acceptsDonationMessage ?? nil,
             acceptsDonationETHAddress: planet.acceptsDonationETHAddress ?? nil,
@@ -257,46 +345,80 @@ class Template: Codable, Identifiable {
             podcastExplicit: planet.podcastExplicit ?? false,
             tags: planet.tags ?? [:]
         )
+        perf.contextPublicPlanetDuration = Self.perfElapsed(since: publicPlanetStartedAt)
+
+        let aboutStartedAt = Self.perfNow()
         let pageAboutHTML = CMarkRenderer.renderMarkdownHTML(markdown: planet.about) ?? planet.about
+        perf.aboutDuration = Self.perfElapsed(since: aboutStartedAt)
+
+        let siteNavigationStartedAt = Self.perfNow()
+        let siteNavigation = planet.siteNavigation()
+        perf.contextSiteNavigationDuration = Self.perfElapsed(since: siteNavigationStartedAt)
+
+        let hasAvatarStartedAt = Self.perfNow()
+        let hasAvatar = planet.hasAvatar()
+        perf.contextHasAvatarDuration = Self.perfElapsed(since: hasAvatarStartedAt)
+
+        let userSettingsStartedAt = Self.perfNow()
+        let userSettings = planet.templateSettingsAndFilters()
+        perf.contextUserSettingsDuration = Self.perfElapsed(since: userSettingsStartedAt)
+
+        let publicArticleStartedAt = Self.perfNow()
+        let publicArticle = article.publicArticle
+        perf.contextPublicArticleDuration = Self.perfElapsed(since: publicArticleStartedAt)
+
+        let styleCSSHashStartedAt = Self.perfNow()
+        let styleCSSHash = styleCSSHash ?? ""
+        perf.contextStyleCSSHashDuration = Self.perfElapsed(since: styleCSSHashStartedAt)
 
         // render stencil template
         var context: [String: Any] = [
             "page_description_html": pageAboutHTML,
             "planet": publicPlanet,
-            "site_navigation": planet.siteNavigation(),
-            "has_avatar": planet.hasAvatar(),
+            "site_navigation": siteNavigation,
+            "has_avatar": hasAvatar,
             "has_podcast": hasPodcast,
             "planet_ipns": article.planet.ipns,
             "assets_prefix": "../",
             "template_settings": self.settings ?? [:],
-            "user_settings": planet.templateSettingsAndFilters(),
+            "user_settings": userSettings,
             "article_id": article.id.uuidString,
-            "article": article.publicArticle,
+            "article": publicArticle,
             "article_type": article.articleType?.rawValue ?? 0,
             "article_title": article.title,
             "article_summary": article.summary ?? "",
             "page_title": article.title,
             "content_html": content_html,
             "build_timestamp": Int(Date().timeIntervalSince1970),
-            "style_css_sha256": styleCSSHash ?? "",
+            "style_css_sha256": styleCSSHash,
             "current_item_type": "blog",
             "social_image_url": article.socialImageURL?.absoluteString
                 ?? article.planet.ogImageURLString,
         ]
+        perf.contextDuration = Self.perfElapsed(since: contextStartedAt)
+
+        let customCodeStartedAt = Self.perfNow()
         context.merge(renderCustomCode(planet: planet, context: context)) { (_, new) in new }
+        perf.customCodeDuration = Self.perfElapsed(since: customCodeStartedAt)
+
+        let stencilStartedAt = Self.perfNow()
         if forSimpleHTML {
             let loader = FileSystemLoader(paths: [
                 Path(blogSimplePath.deletingLastPathComponent().path)
             ])
             let environment = Environment(loader: loader, extensions: [StencilExtension.common])
             let stencilTemplateName = blogSimplePath.lastPathComponent
-            return try environment.renderTemplate(name: stencilTemplateName, context: context)
+            let rendered = try environment.renderTemplate(name: stencilTemplateName, context: context)
+            perf.stencilDuration = Self.perfElapsed(since: stencilStartedAt)
+            return rendered
         }
         else {
             let loader = FileSystemLoader(paths: [Path(blogPath.deletingLastPathComponent().path)])
             let environment = Environment(loader: loader, extensions: [StencilExtension.common])
             let stencilTemplateName = blogPath.lastPathComponent
-            return try environment.renderTemplate(name: stencilTemplateName, context: context)
+            let rendered = try environment.renderTemplate(name: stencilTemplateName, context: context)
+            perf.stencilDuration = Self.perfElapsed(since: stencilStartedAt)
+            return rendered
         }
     }
 
@@ -335,14 +457,14 @@ class Template: Codable, Identifiable {
             "current_item_type": context["current_item_type"] ?? "index",
             "current_page": context["page"] ?? 1,
             "total_pages": context["pages"] ?? 1,
-            "next_page": (getNextPage(
+            "next_page": getNextPage(
                 page: context["page"] as? Int ?? 1,
                 pages: context["pages"] as? Int ?? 1
-            ) ?? nil) as Any,
-            "previous_page": (getPreviousPage(
+            ) as Any,
+            "previous_page": getPreviousPage(
                 page: context["page"] as? Int ?? 1,
                 pages: context["pages"] as? Int ?? 1
-            ) ?? nil) as Any,
+            ) as Any,
         ]
         // items in context would override items in contextForRendering
         for (key, value) in context {
@@ -578,8 +700,6 @@ class Template: Codable, Identifiable {
             juiceboxEnabled: true,
             juiceboxProjectID: nil,
             juiceboxProjectIDGoerli: 207,
-            farcasterEnabled: true,
-            farcasterUsername: "livid",
             acceptsDonation: false,
             acceptsDonationMessage: "",
             acceptsDonationETHAddress: "",
@@ -617,7 +737,7 @@ class Template: Codable, Identifiable {
                 name: stencilTemplateName,
                 context: context
             )
-            try output.data(using: .utf8)?.write(to: articlePath)
+            try output.data(using: .utf8)?.write(to: articlePath, options: .atomic)
             debugPrint("Preview article path: \(articlePath)")
             return articlePath
         }

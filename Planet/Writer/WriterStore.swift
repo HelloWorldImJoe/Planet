@@ -7,12 +7,37 @@ import Foundation
     private var writerWindows: [UUID: WriterWindow] = [:]
 
     func newArticle(for planet: MyPlanetModel) throws {
+        try newArticle(
+            for: planet,
+            initialTitle: "",
+            initialContent: "",
+            attachmentURLs: [],
+            forceNewDraft: false
+        )
+    }
+
+    func newArticle(
+        for planet: MyPlanetModel,
+        initialTitle: String,
+        initialContent: String,
+        attachmentURLs: [URL] = [],
+        forceNewDraft: Bool = false
+    ) throws {
         let draft: DraftModel
-        if planet.drafts.isEmpty {
+        let createdNewDraft = forceNewDraft || planet.drafts.isEmpty
+        if createdNewDraft {
             draft = try DraftModel.create(for: planet)
             planet.drafts.append(draft)
         } else {
             draft = planet.drafts[0]
+        }
+        if createdNewDraft {
+            draft.title = initialTitle
+            draft.content = initialContent
+            for attachmentURL in attachmentURLs {
+                try draft.addAttachment(path: attachmentURL, type: AttachmentType.from(attachmentURL))
+            }
+            try draft.save()
         }
         draft.initialContentSHA256 = draft.contentSHA256()
         openWriterWindow(forDraft: draft)
@@ -44,7 +69,18 @@ import Foundation
         }
         writerWindows.removeValue(forKey: id)
     }
-    
+
+    func isEditing(article: MyArticleModel) -> Bool {
+        writerWindows.values.contains { window in
+            switch window.draft.target! {
+            case .article(let wrapper):
+                return wrapper.value.id == article.id
+            case .myPlanet:
+                return false
+            }
+        }
+    }
+
     func hasActiveWriterWindows() -> Bool {
         if writerWindows.filter({ $0.value.isVisible }).count > 0 {
             return true

@@ -7,28 +7,30 @@
 
 import Cocoa
 import Foundation
+import ImageIO
 
 struct URLUtils {
-    static let applicationSupportPath = try! FileManager.default.url(
-        for: .applicationSupportDirectory,
-        in: .userDomainMask,
-        appropriateFor: nil,
-        create: true
-    )
+    private static func userDirectory(_ directory: FileManager.SearchPathDirectory) -> URL {
+        do {
+            return try FileManager.default.url(
+                for: directory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+        }
+        catch {
+            debugPrint("Failed to resolve user directory \(directory): \(error)")
+            return FileManager.default.urls(for: directory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+        }
+    }
 
-    static let documentsPath = try! FileManager.default.url(
-        for: .documentDirectory,
-        in: .userDomainMask,
-        appropriateFor: nil,
-        create: true
-    )
+    static let applicationSupportPath = userDirectory(.applicationSupportDirectory)
 
-    static let cachesPath = try! FileManager.default.url(
-        for: .cachesDirectory,
-        in: .userDomainMask,
-        appropriateFor: nil,
-        create: true
-    )
+    static let documentsPath = userDirectory(.documentDirectory)
+
+    static let cachesPath = userDirectory(.cachesDirectory)
 
     static let legacyPlanetsPath = applicationSupportPath.appendingPathComponent(
         "planets",
@@ -97,15 +99,91 @@ struct URLUtils {
 
     static let defaultRepoPath: URL = {
         let url = Self.documentsPath.appendingPathComponent("Planet", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
 
     static let temporaryPath: URL = {
         let url = Self.cachesPath.appendingPathComponent("tmp", isDirectory: true)
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
+}
+
+struct AIEndpointSecurityPolicy {
+    private static let allowedInsecureIPv4Ranges: [(network: UInt32, mask: UInt32)] = [
+        (network: 0x7F000000, mask: 0xFF000000),
+        (network: 0x0A000000, mask: 0xFF000000),
+        (network: 0x64000000, mask: 0xFF000000),
+        (network: 0xC0A80000, mask: 0xFFFF0000),
+    ]
+
+    static let insecureHTTPErrorDescription = L10n(
+        "HTTP AI endpoints are only allowed for localhost, 127.0.0.0/8, 10.0.0.0/8, 100.0.0.0/8, and 192.168.0.0/16. Use HTTPS for other hosts."
+    )
+
+    static func modelsURL(base: String) throws -> URL {
+        try endpointURL(base: base, pathComponents: ["models"])
+    }
+
+    static func chatCompletionsURL(base: String) throws -> URL {
+        try endpointURL(base: base, pathComponents: ["chat", "completions"])
+    }
+
+    private static func endpointURL(base: String, pathComponents: [String]) throws -> URL {
+        let trimmedBase = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let baseURL = URL(string: trimmedBase) else {
+            throw validationError(L10n("Invalid URL"))
+        }
+        guard let scheme = baseURL.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw validationError(L10n("Invalid URL"))
+        }
+        guard let host = baseURL.host?.lowercased(), !host.isEmpty else {
+            throw validationError(L10n("Invalid URL"))
+        }
+        if scheme == "http" && !isAllowedInsecureHost(host) {
+            throw validationError(insecureHTTPErrorDescription)
+        }
+        return pathComponents.reduce(baseURL) { partialURL, pathComponent in
+            partialURL.appendingPathComponent(pathComponent)
+        }
+    }
+
+    private static func isAllowedInsecureHost(_ host: String) -> Bool {
+        if host == "localhost" {
+            return true
+        }
+        guard let address = ipv4Address(host) else {
+            return false
+        }
+        return allowedInsecureIPv4Ranges.contains { range in
+            (address & range.mask) == range.network
+        }
+    }
+
+    private static func ipv4Address(_ host: String) -> UInt32? {
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard octets.count == 4 else {
+            return nil
+        }
+
+        var address: UInt32 = 0
+        for octet in octets {
+            guard let value = UInt8(String(octet)) else {
+                return nil
+            }
+            address = (address << 8) | UInt32(truncatingIfNeeded: value)
+        }
+        return address
+    }
+
+    private static func validationError(_ description: String) -> NSError {
+        NSError(
+            domain: "PlanetAIEndpointSecurityPolicy",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: description]
+        )
+    }
 }
 
 extension URL {
@@ -143,7 +221,9 @@ extension URL {
     }
 
     var isPlanetWindowGroupLink: Bool {
-        let windowGroups: [String] = ["planet://Template"]
+        let windowGroups: [String] = [
+            "planet://Template"
+        ]
         return windowGroups.contains(self.absoluteString)
     }
 
@@ -175,19 +255,20 @@ extension URL {
     func removeGPSInfo() {
         do {
             let data = try Data(contentsOf: self)
-            let source = CGImageSourceCreateWithData(data as CFData, nil)!
+            guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return }
             let count = CGImageSourceGetCount(source)
+            guard let type = CGImageSourceGetType(source) else { return }
             let mutableData = NSMutableData()
-            let destination = CGImageDestinationCreateWithData(
+            guard let destination = CGImageDestinationCreateWithData(
                 mutableData,
-                CGImageSourceGetType(source)!,
+                type,
                 count,
                 nil
-            )!
+            ) else { return }
             for i in 0..<count {
-                let image = CGImageSourceCreateImageAtIndex(source, i, nil)!
+                guard let image = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
                 let properties =
-                    CGImageSourceCopyPropertiesAtIndex(source, i, nil) as! [CFString: Any]
+                    CGImageSourceCopyPropertiesAtIndex(source, i, nil) as? [CFString: Any] ?? [:]
                 var newProperties = properties
                 newProperties.removeValue(forKey: kCGImagePropertyGPSDictionary)
                 // newProperties.removeValue(forKey: kCGImagePropertyExifDictionary)
@@ -203,30 +284,36 @@ extension URL {
         }
     }
 
+    var imagePixelWidth: Int? {
+        if let imageSource = CGImageSourceCreateWithURL(self as CFURL, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any],
+           let pixelWidth = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+           pixelWidth > 0
+        {
+            // Retina screenshots from macOS/iOS use 144 DPI (2x) or 216 DPI (3x).
+            // For these, return the logical (point) width so they display at intended size.
+            // Everything else (72 DPI, 300 DPI print, etc.) uses raw pixel width.
+            if let dpi = (properties[kCGImagePropertyDPIWidth] as? NSNumber)?.intValue, dpi > 0 {
+                let scale = dpi / 72
+                if scale == 2 || scale == 3 {
+                    return pixelWidth / scale
+                }
+            }
+            return pixelWidth
+        }
+
+        return NSImage(contentsOf: self)?
+            .representations
+            .compactMap { ($0 as? NSBitmapImageRep)?.pixelsWide }
+            .first(where: { $0 > 0 })
+    }
+
     var htmlCode: String {
         let name = self.lastPathComponent
         if isImage {
-            if let im = NSImage(contentsOf: self) {
-                let imageRep = im.representations.first as? NSBitmapImageRep
-                let width = imageRep?.pixelsWide ?? 0
-                let _ = imageRep?.pixelsHigh ?? 0
-                let pointSize = im.size
-                let pointWidth = pointSize.width
-                let _ = pointSize.height
-                var widthToUse = 0
-                if (CGFloat(width) / pointWidth) > 1 {
-                    widthToUse = Int(pointWidth)
-                }
-                else {
-                    widthToUse = width
-                }
-            if Int(widthToUse) > 0 {
+            if let width = imagePixelWidth, width > 0 {
                 return
-                    "<img width=\"\(Int(widthToUse))\" alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
-                }
-                else {
-                    return "<img alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
-                }
+                    "<img width=\"\(width)\" alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
             }
             return "<img alt=\"\((name as NSString).deletingPathExtension)\" src=\"\(name)\">"
         }
